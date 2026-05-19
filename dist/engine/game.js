@@ -1,0 +1,221 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.createTable = createTable;
+exports.canStart = canStart;
+exports.startHand = startHand;
+exports.applyAction = applyAction;
+exports.addPlayer = addPlayer;
+exports.removePlayer = removePlayer;
+exports.maskForPlayer = maskForPlayer;
+const deck_1 = require("./deck");
+const handEval_1 = require("./handEval");
+function createTable(tableId, sb = 10, bb = 20) {
+    return {
+        tableId, players: [], deck: [], board: [],
+        street: 'waiting', pot: 0, sidePots: [],
+        currentBet: 0, minRaise: bb,
+        dealerIdx: 0, actionIdx: 0,
+        smallBlind: sb, bigBlind: bb,
+        lastActionTime: Date.now(), winners: [],
+    };
+}
+function canStart(state) {
+    return state.players.filter(p => p.connected && p.chips > 0).length >= 2;
+}
+function startHand(state) {
+    const s = deepClone(state);
+    const activePlayers = s.players.filter(p => p.connected && p.chips > 0);
+    if (activePlayers.length < 2)
+        return s;
+    // Reset hand state
+    s.deck = (0, deck_1.shuffle)((0, deck_1.makeDeck)());
+    s.board = [];
+    s.pot = 0;
+    s.sidePots = [];
+    s.currentBet = s.bigBlind;
+    s.minRaise = s.bigBlind;
+    s.winners = [];
+    s.street = 'preflop';
+    s.lastActionTime = Date.now();
+    for (const p of s.players) {
+        p.holeCards = [];
+        p.bet = 0;
+        p.totalBet = 0;
+        p.folded = p.chips === 0;
+        p.allIn = false;
+    }
+    // Move dealer button (skip broke/disconnected)
+    s.dealerIdx = nextActiveIdx(s, s.dealerIdx);
+    // Deal 2 cards to each active player
+    for (const p of s.players.filter(p => !p.folded)) {
+        p.holeCards = [s.deck.pop(), s.deck.pop()];
+    }
+    // Post blinds
+    const sbIdx = nextActiveIdx(s, s.dealerIdx);
+    const bbIdx = nextActiveIdx(s, sbIdx);
+    postBlind(s, sbIdx, s.smallBlind);
+    postBlind(s, bbIdx, s.bigBlind);
+    // Action starts left of BB
+    s.actionIdx = nextActiveIdx(s, bbIdx);
+    return s;
+}
+function postBlind(s, idx, amount) {
+    const p = s.players[idx];
+    if (!p)
+        return;
+    const actual = Math.min(amount, p.chips);
+    p.chips -= actual;
+    p.bet += actual;
+    p.totalBet += actual;
+    s.pot += actual;
+    if (p.chips === 0)
+        p.allIn = true;
+}
+function applyAction(state, playerId, action, amount = 0) {
+    const s = deepClone(state);
+    const p = s.players[s.actionIdx];
+    if (!p || p.id !== playerId || p.folded || p.allIn)
+        return s;
+    const toCall = s.currentBet - p.bet;
+    switch (action) {
+        case 'fold':
+            p.folded = true;
+            break;
+        case 'check':
+            if (toCall > 0)
+                return s; // can't check
+            break;
+        case 'call': {
+            const callAmt = Math.min(toCall, p.chips);
+            p.chips -= callAmt;
+            p.bet += callAmt;
+            p.totalBet += callAmt;
+            s.pot += callAmt;
+            if (p.chips === 0)
+                p.allIn = true;
+            break;
+        }
+        case 'raise':
+        case 'allin': {
+            const raiseAmt = action === 'allin' ? p.chips : Math.min(amount, p.chips);
+            if (raiseAmt < s.minRaise && p.chips > raiseAmt)
+                return s; // invalid raise
+            const newBet = p.bet + raiseAmt;
+            s.minRaise = Math.max(s.minRaise, newBet - s.currentBet);
+            s.currentBet = Math.max(s.currentBet, newBet);
+            p.chips -= raiseAmt;
+            p.bet += raiseAmt;
+            p.totalBet += raiseAmt;
+            s.pot += raiseAmt;
+            if (p.chips === 0)
+                p.allIn = true;
+            break;
+        }
+    }
+    s.lastActionTime = Date.now();
+    // Check if street is over
+    if (isStreetOver(s)) {
+        return advanceStreet(s);
+    }
+    s.actionIdx = nextActiveIdx(s, s.actionIdx);
+    return s;
+}
+function isStreetOver(s) {
+    const active = s.players.filter(p => !p.folded && !p.allIn);
+    if (active.length === 0)
+        return true;
+    // All active players have matched the current bet
+    return active.every(p => p.bet === s.currentBet || p.allIn);
+}
+function advanceStreet(s) {
+    // Reset bets for new street
+    for (const p of s.players)
+        p.bet = 0;
+    s.currentBet = 0;
+    s.minRaise = s.bigBlind;
+    const notFolded = s.players.filter(p => !p.folded);
+    if (notFolded.length === 1) {
+        // Everyone else folded — winner takes pot
+        s.winners = [{ playerId: notFolded[0].id, amount: s.pot, hand: 'Last standing' }];
+        notFolded[0].chips += s.pot;
+        s.pot = 0;
+        s.street = 'showdown';
+        return s;
+    }
+    switch (s.street) {
+        case 'preflop':
+            s.board.push(s.deck.pop(), s.deck.pop(), s.deck.pop()); // flop
+            s.street = 'flop';
+            break;
+        case 'flop':
+            s.board.push(s.deck.pop()); // turn
+            s.street = 'turn';
+            break;
+        case 'turn':
+            s.board.push(s.deck.pop()); // river
+            s.street = 'river';
+            break;
+        case 'river':
+            s.street = 'showdown';
+            return resolveShowdown(s);
+    }
+    // Action starts from first active player left of dealer
+    s.actionIdx = nextActiveIdx(s, s.dealerIdx);
+    return s;
+}
+function resolveShowdown(s) {
+    const contenders = s.players.filter(p => !p.folded);
+    const results = contenders.map(p => ({
+        player: p,
+        result: (0, handEval_1.evaluate)([...p.holeCards, ...s.board]),
+    }));
+    results.sort((a, b) => (0, handEval_1.compareHands)(b.result, a.result));
+    const winner = results[0];
+    // Simple: winner takes all (no side pots for MVP)
+    winner.player.chips += s.pot;
+    s.winners = [{ playerId: winner.player.id, amount: s.pot, hand: winner.result.name }];
+    s.pot = 0;
+    return s;
+}
+function nextActiveIdx(s, fromIdx) {
+    const n = s.players.length;
+    let idx = (fromIdx + 1) % n;
+    let tries = 0;
+    while (tries < n) {
+        const p = s.players[idx];
+        if (p && !p.folded && !p.allIn && p.connected && p.chips > 0)
+            return idx;
+        idx = (idx + 1) % n;
+        tries++;
+    }
+    return fromIdx;
+}
+function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
+function addPlayer(state, id, name, chips, seat) {
+    const s = deepClone(state);
+    const existing = s.players.find(p => p.id === id);
+    if (existing) {
+        existing.connected = true;
+        return s;
+    }
+    s.players.push({ id, name, chips, holeCards: [], bet: 0, totalBet: 0, folded: false, allIn: false, connected: true, seatIndex: seat });
+    s.players.sort((a, b) => a.seatIndex - b.seatIndex);
+    return s;
+}
+function removePlayer(state, id) {
+    const s = deepClone(state);
+    const p = s.players.find(p => p.id === id);
+    if (p)
+        p.connected = false;
+    return s;
+}
+// Mask hole cards for a specific viewer (hide opponent cards)
+function maskForPlayer(state, viewerId) {
+    const s = deepClone(state);
+    for (const p of s.players) {
+        if (p.id !== viewerId && s.street !== 'showdown') {
+            p.holeCards = p.holeCards.map(() => ({ rank: '?', suit: '?' }));
+        }
+    }
+    return s;
+}
