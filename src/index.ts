@@ -173,7 +173,22 @@ app.post('/api/auth', async (req, res) => {
     }
 
     const user = rows[0]
-    // Check if spin is available (for client to show popup)
+
+    // Update login streak (no chip bonus, just counter for achievements)
+    const today = new Date().toISOString().slice(0, 10)
+    const lastLogin = user.last_login_date ? String(user.last_login_date).slice(0, 10) : null
+    if (lastLogin !== today) {
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+      const newStreak = lastLogin === yesterday ? (user.streak_days || 0) + 1 : 1
+      await db.query(
+        `UPDATE pf_users SET streak_days=$1, last_login_date=$2 WHERE tg_id=$3`,
+        [newStreak, today, tgId]
+      )
+      user.streak_days = newStreak
+      user.last_login_date = today
+    }
+
+    // Check if spin is available
     const canSpin = !user.last_spin_at ||
       (Date.now() - new Date(user.last_spin_at).getTime()) >= 86_400_000
 
