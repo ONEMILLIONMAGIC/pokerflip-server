@@ -19,10 +19,10 @@ app.get('/tables', (_req, res) => {
   res.json({ tables: [{ id: 'main', name: 'Main Table', blinds: '10/20', players: 0, maxPlayers: 6 }] })
 })
 
-// POST /api/auth — upsert user, return chips
+// POST /api/auth — upsert user, handle referral, return user
 app.post('/api/auth', async (req, res) => {
   try {
-    const { initData } = req.body as { initData?: string }
+    const { initData, startParam } = req.body as { initData?: string; startParam?: string }
     if (!initData) return res.status(400).json({ error: 'no initData' })
 
     const params = validateTgInitData(initData)
@@ -31,18 +31,62 @@ app.post('/api/auth', async (req, res) => {
     const tgUser = parseTgUser(params)
     if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
 
+    const tgId = String(tgUser.id)
     const db = getPool()
+
+    // Check if new user
+    const existing = await db.query('SELECT tg_id FROM pf_users WHERE tg_id=$1', [tgId])
+    const isNew = existing.rows.length === 0
+
+    // Referrer: startParam is referrer's tg_id (don't self-refer)
+    const referrerId = startParam && startParam !== tgId ? startParam : null
+
     const { rows } = await db.query(
-      `INSERT INTO pf_users (tg_id, username, first_name, photo_url)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO pf_users (tg_id, username, first_name, photo_url, referred_by)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (tg_id) DO UPDATE SET
          username   = EXCLUDED.username,
          first_name = EXCLUDED.first_name,
          photo_url  = EXCLUDED.photo_url
        RETURNING *`,
-      [String(tgUser.id), tgUser.username || null, tgUser.first_name || null, tgUser.photo_url || null]
+      [tgId, tgUser.username || null, tgUser.first_name || null, tgUser.photo_url || null,
+       isNew ? referrerId : undefined]
     )
+
+    // Credit referrer 10K chips once (only for new users)
+    if (isNew && referrerId) {
+      await db.query(
+        `UPDATE pf_users SET chips = chips + 10000, referrals_count = referrals_count + 1
+         WHERE tg_id = $1`,
+        [referrerId]
+      )
+    }
+
     res.json(rows[0])
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'server error' })
+  }
+})
+
+// GET /api/referral — return referral stats
+app.get('/api/referral', async (req, res) => {
+  try {
+    const initData = req.headers['x-init-data'] as string
+    if (!initData) return res.status(400).json({ error: 'no initData' })
+
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'invalid' })
+
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
+
+    const db = getPool()
+    const { rows } = await db.query(
+      'SELECT referrals_count FROM pf_users WHERE tg_id=$1',
+      [String(tgUser.id)]
+    )
+    res.json({ referrals_count: rows[0]?.referrals_count || 0, tg_id: String(tgUser.id) })
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'server error' })
