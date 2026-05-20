@@ -1,6 +1,6 @@
 import { WebSocket, WebSocketServer } from 'ws'
 import { GameState, createTable, addPlayer, removePlayer, startHand, applyAction, canStart, maskForPlayer, PlayerAction } from './engine/game'
-import { getPool } from './db'
+import { getPool, logTransaction } from './db'
 
 interface Client {
   ws: WebSocket
@@ -26,12 +26,6 @@ const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; m
   limit2:   { sb: 25,  bb: 50,  minBuyIn: 1000 },
   limit3:   { sb: 50,  bb: 100, minBuyIn: 2000 },
   limit4:   { sb: 100, bb: 200, minBuyIn: 5000 },
-  // Pot Limit Omaha
-  plo1:     { sb: 25,  bb: 50,  minBuyIn: 1000 },
-  plo2:     { sb: 50,  bb: 100, minBuyIn: 2000 },
-  // NL Omaha
-  nlo1:     { sb: 25,  bb: 50,  minBuyIn: 1000 },
-  nlo2:     { sb: 50,  bb: 100, minBuyIn: 2000 },
   // 1v1 Heads Up
   heads1:   { sb: 25,  bb: 50,  minBuyIn: 1000, maxPlayers: 2 },
   heads2:   { sb: 25,  bb: 50,  minBuyIn: 1000, maxPlayers: 2 },
@@ -273,6 +267,10 @@ async function saveHandStats(state: GameState) {
        WHERE tg_id = $4`,
       [player.chips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]
     ).catch(() => {})
+
+    if (isWinner && wonAmount > 0) {
+      await logTransaction(player.id, 'win', wonAmount, `Won hand at table ${state.tableId}`)
+    }
   }
   console.log(`Hand saved: winners=${[...winnerIds].join(',')}`)
 }

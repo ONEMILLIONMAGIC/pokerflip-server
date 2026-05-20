@@ -4,7 +4,7 @@ import { WebSocketServer } from 'ws'
 import cors from 'cors'
 import dotenv from 'dotenv'
 import { setupWS, getTableStats } from './wsServer'
-import { initDB, getPool } from './db'
+import { initDB, getPool, logTransaction } from './db'
 import { validateTgInitData, parseTgUser } from './utils'
 
 dotenv.config()
@@ -19,66 +19,69 @@ app.get('/tables', (_req, res) => {
   res.json(getTableStats())
 })
 
-// Tournament registrations (in-memory, resets on redeploy)
-const tournamentRegs = new Map<string, Set<string>>()
 const MIN_PLAYERS = 6
 
-function getTournamentState() {
+function nextOccurrence(hour: number, minute = 0, weekday?: number) {
   const now = new Date()
-
-  function nextDaily() {
-    const d = new Date(now); d.setHours(20, 0, 0, 0)
-    if (d <= now) d.setDate(d.getDate() + 1)
-    return d
+  const d = new Date(now)
+  if (weekday !== undefined) {
+    const diff = (weekday - d.getDay() + 7) % 7 || 7
+    d.setDate(d.getDate() + diff)
   }
-  function nextWeekly() {
-    const d = new Date(now)
-    const daysUntilSun = d.getDay() === 0 ? 7 : 7 - d.getDay()
-    d.setDate(d.getDate() + daysUntilSun); d.setHours(21, 0, 0, 0)
-    if (d <= now) d.setDate(d.getDate() + 7)
-    return d
-  }
+  d.setHours(hour, minute, 0, 0)
+  if (d <= now) d.setDate(d.getDate() + (weekday !== undefined ? 7 : 1))
+  return d
+}
 
-  const dailyRegs = tournamentRegs.get('daily')?.size || 0
-  const weeklyRegs = tournamentRegs.get('weekly')?.size || 0
+async function getTournamentState() {
+  const db = getPool()
+  const { rows } = await db.query(
+    `SELECT tournament_id, COUNT(*) as cnt FROM pf_tournament_regs GROUP BY tournament_id`
+  ).catch(() => ({ rows: [] as any[] }))
+  const counts: Record<string, number> = {}
+  rows.forEach((r: any) => { counts[r.tournament_id] = Number(r.cnt) })
 
   return {
-    daily:  { nextAt: nextDaily().toISOString(),  prize: '50,000',  buyIn: '2,000', registered: dailyRegs,  minPlayers: MIN_PLAYERS, canStart: dailyRegs >= MIN_PLAYERS },
-    weekly: { nextAt: nextWeekly().toISOString(), prize: '300,000', buyIn: '5,000', registered: weeklyRegs, minPlayers: MIN_PLAYERS, canStart: weeklyRegs >= MIN_PLAYERS },
+    daily:  { nextAt: nextOccurrence(20).toISOString(),       prize: '50,000',  buyIn: '2,000', registered: counts['daily'] || 0,  minPlayers: MIN_PLAYERS, canStart: (counts['daily'] || 0) >= MIN_PLAYERS },
+    weekly: { nextAt: nextOccurrence(21, 0, 0).toISOString(), prize: '300,000', buyIn: '5,000', registered: counts['weekly'] || 0, minPlayers: MIN_PLAYERS, canStart: (counts['weekly'] || 0) >= MIN_PLAYERS },
   }
 }
 
 // GET /api/tournaments
-app.get('/api/tournaments', (_req, res) => res.json(getTournamentState()))
+app.get('/api/tournaments', async (_req, res) => {
+  try { res.json(await getTournamentState()) }
+  catch (e) { res.status(500).json({ error: 'server error' }) }
+})
 
 // POST /api/tournaments/register
 app.post('/api/tournaments/register', async (req, res) => {
   try {
     const { initData, tournamentId } = req.body as { initData?: string; tournamentId?: string }
     if (!initData || !tournamentId) return res.status(400).json({ error: 'missing params' })
-
     const params = validateTgInitData(initData)
     if (!params) return res.status(403).json({ error: 'invalid initData' })
-
     const tgUser = parseTgUser(params)
     if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
 
-    // Check buy-in
     const buyIns: Record<string, number> = { daily: 2000, weekly: 5000 }
     const cost = buyIns[tournamentId]
     if (!cost) return res.status(400).json({ error: 'unknown tournament' })
 
     const db = getPool()
-    const { rows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [String(tgUser.id)])
-    if (!rows[0] || rows[0].chips < cost) return res.status(400).json({ error: 'insufficient_chips', required: cost })
+    const { rows: userRows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [String(tgUser.id)])
+    if (!userRows[0] || userRows[0].chips < cost) return res.status(400).json({ error: 'insufficient_chips', required: cost })
 
-    // Deduct buy-in
-    await db.query('UPDATE pf_users SET chips = chips - $1 WHERE tg_id=$2', [cost, String(tgUser.id)])
+    // Idempotent insert
+    const { rowCount } = await db.query(
+      `INSERT INTO pf_tournament_regs (tg_id, tournament_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [String(tgUser.id), tournamentId]
+    )
+    if (rowCount && rowCount > 0) {
+      await db.query('UPDATE pf_users SET chips = chips - $1 WHERE tg_id=$2', [cost, String(tgUser.id)])
+      await logTransaction(String(tgUser.id), 'tournament', -cost, `Registered: ${tournamentId} tournament`)
+    }
 
-    if (!tournamentRegs.has(tournamentId)) tournamentRegs.set(tournamentId, new Set())
-    tournamentRegs.get(tournamentId)!.add(String(tgUser.id))
-
-    res.json({ ok: true, ...getTournamentState() })
+    res.json({ ok: true, ...(await getTournamentState()) })
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'server error' })
@@ -210,7 +213,29 @@ app.post('/api/claim', async (req, res) => {
        WHERE tg_id=$1 RETURNING *`,
       [String(tgUser.id)]
     )
+    await logTransaction(String(tgUser.id), 'claim', 500, 'Free chips claimed')
     res.json(updated[0])
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'server error' })
+  }
+})
+
+// GET /api/transactions
+app.get('/api/transactions', async (req, res) => {
+  try {
+    const initData = req.headers['x-init-data'] as string
+    if (!initData) return res.status(400).json({ error: 'no initData' })
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'invalid' })
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
+    const db = getPool()
+    const { rows } = await db.query(
+      `SELECT type, amount, desc, created_at FROM pf_transactions WHERE tg_id=$1 ORDER BY created_at DESC LIMIT 30`,
+      [String(tgUser.id)]
+    )
+    res.json(rows)
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'server error' })
@@ -286,6 +311,7 @@ app.post('/api/payments/stars-confirm', async (req, res) => {
       [pkg.chips, String(tgUser.id)]
     )
     if (!rows[0]) return res.status(404).json({ error: 'user not found' })
+    await logTransaction(String(tgUser.id), 'purchase', pkg.chips, `Bought ${pkg.label} (Stars)`)
     res.json(rows[0])
   } catch (e) {
     console.error(e)
