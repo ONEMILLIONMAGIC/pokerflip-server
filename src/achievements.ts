@@ -32,15 +32,15 @@ function calcXP(u: any) {
 export async function getAchievements(tgId: string): Promise<Achievement[]> {
   const db = getPool()
 
-  const [userRes, earnedRes, purchaseRes, tournamentRes] = await Promise.all([
-    db.query('SELECT * FROM pf_users WHERE tg_id=$1', [tgId]),
-    db.query('SELECT achievement_id, unlocked_at FROM pf_achievements WHERE tg_id=$1', [tgId]),
-    db.query("SELECT 1 FROM pf_transactions WHERE tg_id=$1 AND type='purchase' LIMIT 1", [tgId]),
-    db.query('SELECT 1 FROM pf_tournament_regs WHERE tg_id=$1 LIMIT 1', [tgId]),
-  ])
-
+  const userRes = await db.query('SELECT * FROM pf_users WHERE tg_id=$1', [tgId])
   const user = userRes.rows[0]
-  if (!user) return []
+  if (!user) return DEFS.map(d => ({ id: d.id, icon: d.icon, name: d.name, desc: d.desc, bonus: d.bonus, unlocked: false }))
+
+  const [earnedRes, purchaseRes, tournamentRes] = await Promise.all([
+    db.query('SELECT achievement_id, unlocked_at FROM pf_achievements WHERE tg_id=$1', [tgId]).catch(() => ({ rows: [] })),
+    db.query("SELECT 1 FROM pf_transactions WHERE tg_id=$1 AND type='purchase' LIMIT 1", [tgId]).catch(() => ({ rows: [] })),
+    db.query('SELECT 1 FROM pf_tournament_regs WHERE tg_id=$1 LIMIT 1', [tgId]).catch(() => ({ rows: [] })),
+  ])
 
   const earned = new Map(earnedRes.rows.map((r: any) => [r.achievement_id, r.unlocked_at]))
   const extra = { hasPurchase: purchaseRes.rows.length > 0, hasTournament: tournamentRes.rows.length > 0 }
