@@ -367,14 +367,11 @@ app.post('/api/payments/ton-verify', async (req, res) => {
     if (!pkg) return res.status(400).json({ error: 'unknown package' })
 
     const db = getPool()
-
-    // Check already credited
-    const { rows: used } = await db.query('SELECT 1 FROM pf_ton_payments WHERE boc_hash=$1', [ref])
-    if (used.length > 0) return res.status(409).json({ error: 'already_used' })
+    const tgId = String(tgUser.id)
 
     // Query tonapi.io for recent incoming transactions
     const tonRes = await fetch(
-      `https://tonapi.io/v2/blockchain/accounts/${WALLET}/transactions?limit=30`,
+      `https://tonapi.io/v2/blockchain/accounts/${WALLET}/transactions?limit=50`,
       { signal: AbortSignal.timeout(8000) }
     )
     if (!tonRes.ok) return res.status(502).json({ error: 'blockchain unavailable' })
@@ -383,7 +380,7 @@ app.post('/api/payments/ton-verify', async (req, res) => {
     const txList = (tonData.transactions as any[]) || []
     const twoHoursAgo = Math.floor(Date.now() / 1000) - 7200
 
-    // 1st: exact ref match
+    // 1st: exact ref match (ref contains tgId + packageId + timestamp)
     let tx = txList.find((t: any) => {
       const msg = t.in_msg
       if (!msg) return false
@@ -392,35 +389,42 @@ app.post('/api/payments/ton-verify', async (req, res) => {
       return comment === ref && value >= pkg.nanotons * 0.95
     })
 
-    // 2nd fallback: correct amount in last 2h, comment empty or starts with "pf_" (user's transfer)
+    // 2nd fallback: comment must start with THIS user's prefix (pf_{tgId}_{packageId}_)
+    // so we never accidentally match another user's transaction
     if (!tx) {
+      const userRefPrefix = `pf_${tgId}_${packageId}_`
       tx = txList.find((t: any) => {
         const msg = t.in_msg
         if (!msg) return false
         const value = Number(msg.value || 0)
         const utime = Number(t.utime || 0)
         const comment = msg.decoded_body?.text || ''
-        const rightAmount = value >= pkg.nanotons * 0.90 && value <= pkg.nanotons * 1.10
+        const rightAmount = value >= pkg.nanotons * 0.95 && value <= pkg.nanotons * 1.05
         const recent = utime >= twoHoursAgo
-        const notAlienTx = comment === '' || comment.startsWith('pf_')
-        return rightAmount && recent && notAlienTx
+        const isOwnRef = comment.startsWith(userRefPrefix)
+        return rightAmount && recent && isOwnRef
       })
     }
 
     if (!tx) return res.json({ found: false })
 
-    // Found — credit chips
-    const txId = `tonapi_${tx.hash || tx.utime || ref}`
-    await db.query(
-      'INSERT INTO pf_ton_payments (boc_hash, tg_id, package_id, chips) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING',
-      [txId, String(tgUser.id), packageId, pkg.chips]
+    // Deduplicate by tx hash — use RETURNING to detect if INSERT actually happened.
+    // ON CONFLICT DO NOTHING silently skips; without checking the result we would
+    // still credit chips for an already-credited transaction.
+    const txId = `tonapi_${tx.hash || tx.utime}`
+    const { rows: inserted } = await db.query(
+      'INSERT INTO pf_ton_payments (boc_hash, tg_id, package_id, chips) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING boc_hash',
+      [txId, tgId, packageId, pkg.chips]
     )
+    // If no row returned the tx was already credited — stop here
+    if (inserted.length === 0) return res.status(409).json({ error: 'already_used' })
+
     const { rows } = await db.query(
       'UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING chips',
-      [pkg.chips, String(tgUser.id)]
+      [pkg.chips, tgId]
     )
     if (!rows[0]) return res.status(404).json({ error: 'user not found' })
-    await logTransaction(String(tgUser.id), 'purchase', pkg.chips, `Bought ${pkg.chips.toLocaleString()} chips (TON verified)`)
+    await logTransaction(tgId, 'purchase', pkg.chips, `Bought ${pkg.chips.toLocaleString()} chips (TON verified)`)
 
     res.json({ found: true, chips: rows[0].chips })
   } catch (e: any) {
