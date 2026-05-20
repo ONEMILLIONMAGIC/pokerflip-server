@@ -590,6 +590,24 @@ app.post('/api/payments/stars-confirm', async (req, res) => {
   }
 })
 
+// GET /api/balance — lightweight chips check (no DB writes)
+app.get('/api/balance', async (req, res) => {
+  try {
+    const initData = req.headers['x-init-data'] as string
+    if (!initData) return res.status(400).json({ error: 'no initData' })
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'invalid' })
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
+    const db = getPool()
+    const { rows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [String(tgUser.id)])
+    if (!rows[0]) return res.status(404).json({ error: 'user not found' })
+    res.json({ chips: rows[0].chips, tg_id: String(tgUser.id) })
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'server error' })
+  }
+})
+
 // POST /api/admin/credit — manual chip credit (protected by ADMIN_SECRET)
 app.post('/api/admin/credit', async (req, res) => {
   const secret = req.headers['x-admin-secret']
