@@ -15,6 +15,42 @@ app.use(express.json())
 
 app.get('/', (_req, res) => res.json({ status: 'PokerFlip server running ♠️' }))
 
+// Telegram bot webhook
+app.post('/api/webhook', async (req, res) => {
+  res.sendStatus(200)
+  try {
+    const update = req.body
+    const msg = update?.message
+    if (!msg) return
+
+    const chatId = msg.chat.id
+    const text = msg.text || ''
+    const firstName = msg.from?.first_name || 'Player'
+
+    if (text.startsWith('/start')) {
+      const botToken = process.env.BOT_TOKEN
+      if (!botToken) return
+
+      await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: `♠️ Welcome to *PokerFlip*, ${firstName}!\n\nPlay Texas Hold'em poker with free chips.\n\n🎁 *3,000 chips* to start\n⏰ Claim *+500 chips* every 6 hours\n🔥 Daily login bonus (up to 1,000/day)\n👥 Invite friends → *+3,000 chips* each\n\nJoin tables, climb the leaderboard, win tournaments!`,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '♠️ Play Now', web_app: { url: 'https://pokerflip-client.onrender.com' } }
+            ]]
+          }
+        })
+      })
+    }
+  } catch (e) {
+    console.error('Webhook error:', e)
+  }
+})
+
 app.get('/tables', (_req, res) => {
   res.json(getTableStats())
 })

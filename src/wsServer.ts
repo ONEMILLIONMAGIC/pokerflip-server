@@ -125,10 +125,20 @@ function handleDisconnect(ws: WebSocket) {
   const { tableId, playerId } = client
   let state = tables.get(tableId)
   if (!state) return
+
+  // Save chips before removing player
+  const player = state.players.find(p => p.id === playerId)
+  if (player && process.env.DATABASE_URL) {
+    getPool().query(
+      'UPDATE pf_users SET chips = $1 WHERE tg_id = $2',
+      [player.chips, playerId]
+    ).catch(e => console.error('Failed to save chips on disconnect:', e))
+  }
+
   state = removePlayer(state, playerId)
   tables.set(tableId, state)
   broadcastTable(tableId)
-  console.log(`Player ${playerId} disconnected from ${tableId}`)
+  console.log(`Player ${playerId} disconnected from ${tableId}, chips saved: ${player?.chips}`)
 }
 
 function scheduleStart(tableId: string) {
