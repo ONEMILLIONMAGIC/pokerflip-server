@@ -16,10 +16,17 @@ const startTimers = new Map<string, NodeJS.Timeout>()
 const actionTimers = new Map<string, NodeJS.Timeout>()
 
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
+  // Cash tables — NL Hold'em
   main:     { sb: 10,  bb: 20,  minBuyIn: 400 },
-  royal:    { sb: 25,  bb: 50,  minBuyIn: 1000 },
+  shadow:   { sb: 25,  bb: 50,  minBuyIn: 1000 },
+  crimson:  { sb: 50,  bb: 100, minBuyIn: 2000 },
   obsidian: { sb: 100, bb: 200, minBuyIn: 5000 },
-  heads:    { sb: 25,  bb: 50,  minBuyIn: 1000, maxPlayers: 2 },
+  // 1v1 Heads Up
+  heads1:   { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
+  heads2:   { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
+  heads3:   { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
+  heads4:   { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
+  // Tournaments
   daily:    { sb: 50,  bb: 100, minBuyIn: 2000 },
   weekly:   { sb: 100, bb: 200, minBuyIn: 5000 },
 }
