@@ -79,6 +79,76 @@ app.post('/api/claim', async (req, res) => {
         res.status(500).json({ error: 'server error' });
     }
 });
+const PACKAGES = {
+    starter: { chips: 50000, stars: 50, label: 'Chips Starter' },
+    standard: { chips: 150000, stars: 149, label: 'Chips Standard' },
+    popular: { chips: 500000, stars: 499, label: 'Chips Popular' },
+    whale: { chips: 1000000, stars: 899, label: 'Chips Whale' },
+    legend: { chips: 5000000, stars: 3999, label: 'Chips Legend' },
+};
+// POST /api/payments/stars-invoice
+app.post('/api/payments/stars-invoice', async (req, res) => {
+    try {
+        const { initData, packageId } = req.body;
+        if (!initData || !packageId)
+            return res.status(400).json({ error: 'missing params' });
+        const params = (0, utils_1.validateTgInitData)(initData);
+        if (!params)
+            return res.status(403).json({ error: 'invalid initData' });
+        const pkg = PACKAGES[packageId];
+        if (!pkg)
+            return res.status(400).json({ error: 'unknown package' });
+        const tgUser = (0, utils_1.parseTgUser)(params);
+        if (!tgUser?.id)
+            return res.status(400).json({ error: 'no user' });
+        const payload = JSON.stringify({ tg_id: String(tgUser.id), packageId });
+        const resp = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/createInvoiceLink`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: pkg.label,
+                description: `${pkg.chips.toLocaleString()} play chips for PokerFlip`,
+                payload,
+                currency: 'XTR',
+                prices: [{ label: pkg.label, amount: pkg.stars }],
+            }),
+        });
+        const data = await resp.json();
+        if (!data.ok)
+            return res.status(500).json({ error: data.description });
+        res.json({ invoiceUrl: data.result });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'server error' });
+    }
+});
+// POST /api/payments/stars-confirm
+app.post('/api/payments/stars-confirm', async (req, res) => {
+    try {
+        const { initData, packageId } = req.body;
+        if (!initData || !packageId)
+            return res.status(400).json({ error: 'missing params' });
+        const params = (0, utils_1.validateTgInitData)(initData);
+        if (!params)
+            return res.status(403).json({ error: 'invalid initData' });
+        const pkg = PACKAGES[packageId];
+        if (!pkg)
+            return res.status(400).json({ error: 'unknown package' });
+        const tgUser = (0, utils_1.parseTgUser)(params);
+        if (!tgUser?.id)
+            return res.status(400).json({ error: 'no user' });
+        const db = (0, db_1.getPool)();
+        const { rows } = await db.query(`UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING *`, [pkg.chips, String(tgUser.id)]);
+        if (!rows[0])
+            return res.status(404).json({ error: 'user not found' });
+        res.json(rows[0]);
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'server error' });
+    }
+});
 const server = (0, http_1.createServer)(app);
 const wss = new ws_1.WebSocketServer({ server });
 (0, wsServer_1.setupWS)(wss);
