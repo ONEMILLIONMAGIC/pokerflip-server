@@ -162,11 +162,10 @@ function setActionTimer(tableId: string) {
     if (!state || state.street === 'waiting' || state.street === 'showdown') return
     const p = state.players[state.actionIdx]
     if (!p || p.folded || p.allIn) { setActionTimer(tableId); return }
-    const prevStreet = state.street
     state = applyAction(state, p.id, 'fold')
     tables.set(tableId, state)
     broadcastTable(tableId)
-    if (state.street === 'showdown' && prevStreet !== 'showdown') {
+    if (state.street === 'showdown') {
       saveHandStats(state).catch(console.error)
       setTimeout(() => {
         let s = tables.get(tableId)
