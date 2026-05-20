@@ -16,16 +16,27 @@ const startTimers = new Map<string, NodeJS.Timeout>()
 const actionTimers = new Map<string, NodeJS.Timeout>()
 
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
-  // Cash tables — NL Hold'em
+  // NL Hold'em
   main:     { sb: 10,  bb: 20,  minBuyIn: 400 },
   shadow:   { sb: 25,  bb: 50,  minBuyIn: 1000 },
   crimson:  { sb: 50,  bb: 100, minBuyIn: 2000 },
   obsidian: { sb: 100, bb: 200, minBuyIn: 5000 },
+  // Limit Hold'em
+  limit1:   { sb: 10,  bb: 20,  minBuyIn: 400 },
+  limit2:   { sb: 25,  bb: 50,  minBuyIn: 1000 },
+  limit3:   { sb: 50,  bb: 100, minBuyIn: 2000 },
+  limit4:   { sb: 100, bb: 200, minBuyIn: 5000 },
+  // Pot Limit Omaha
+  plo1:     { sb: 25,  bb: 50,  minBuyIn: 1000 },
+  plo2:     { sb: 50,  bb: 100, minBuyIn: 2000 },
+  // NL Omaha
+  nlo1:     { sb: 25,  bb: 50,  minBuyIn: 1000 },
+  nlo2:     { sb: 50,  bb: 100, minBuyIn: 2000 },
   // 1v1 Heads Up
-  heads1:   { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
-  heads2:   { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
-  heads3:   { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
-  heads4:   { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
+  heads1:   { sb: 25,  bb: 50,  minBuyIn: 1000, maxPlayers: 2 },
+  heads2:   { sb: 25,  bb: 50,  minBuyIn: 1000, maxPlayers: 2 },
+  heads3:   { sb: 25,  bb: 50,  minBuyIn: 1000, maxPlayers: 2 },
+  heads4:   { sb: 25,  bb: 50,  minBuyIn: 1000, maxPlayers: 2 },
   // Tournaments
   daily:    { sb: 50,  bb: 100, minBuyIn: 2000 },
   weekly:   { sb: 100, bb: 200, minBuyIn: 5000 },
