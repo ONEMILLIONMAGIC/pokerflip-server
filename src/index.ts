@@ -250,7 +250,7 @@ app.post('/api/auth', async (req, res) => {
          photo_url  = COALESCE(EXCLUDED.photo_url, pf_users.photo_url)
        RETURNING *`,
       [tgId, tgUser.username || null, tgUser.first_name || null, tgUser.photo_url || null,
-       isNew ? referrerId : undefined]
+       referrerId]
     )
 
     // Credit referrer once for new users
