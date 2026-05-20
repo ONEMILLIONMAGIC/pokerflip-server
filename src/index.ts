@@ -347,7 +347,10 @@ app.post('/api/payments/ton-confirm', async (req, res) => {
     if (!initData || !packageId || !bocHash) return res.status(400).json({ error: 'missing params' })
 
     const params = validateTgInitData(initData)
-    if (!params) return res.status(403).json({ error: 'invalid initData' })
+    if (!params) {
+      console.error('ton-confirm: invalid initData, token set:', !!process.env.BOT_TOKEN)
+      return res.status(403).json({ error: 'invalid initData' })
+    }
 
     const tgUser = parseTgUser(params)
     if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
@@ -364,20 +367,21 @@ app.post('/api/payments/ton-confirm', async (req, res) => {
 
     const db = getPool()
 
-    // Ensure table exists
-    await db.query(`CREATE TABLE IF NOT EXISTS pf_ton_payments (
-      boc_hash TEXT PRIMARY KEY, tg_id TEXT NOT NULL,
-      package_id TEXT NOT NULL, chips INTEGER NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`).catch(() => {})
-
-    // Prevent double-spending
-    const { rows: existing } = await db.query('SELECT 1 FROM pf_ton_payments WHERE boc_hash=$1', [bocHash]).catch(() => ({ rows: [] }))
+    // Check for double-spend
+    const { rows: existing } = await db.query(
+      'SELECT 1 FROM pf_ton_payments WHERE boc_hash=$1', [bocHash]
+    )
     if (existing.length > 0) return res.status(409).json({ error: 'already_used' })
 
-    // Credit chips and record payment
-    await db.query('INSERT INTO pf_ton_payments (boc_hash, tg_id, package_id, chips) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [bocHash, String(tgUser.id), packageId, pkg.chips])
-    const { rows } = await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING *', [pkg.chips, String(tgUser.id)])
+    // Record payment atomically then credit
+    await db.query(
+      'INSERT INTO pf_ton_payments (boc_hash, tg_id, package_id, chips) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING',
+      [bocHash, String(tgUser.id), packageId, pkg.chips]
+    )
+    const { rows } = await db.query(
+      'UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING *',
+      [pkg.chips, String(tgUser.id)]
+    )
     if (!rows[0]) return res.status(404).json({ error: 'user not found' })
     await logTransaction(String(tgUser.id), 'purchase', pkg.chips, `Bought ${pkg.chips.toLocaleString()} chips (TON)`)
 
