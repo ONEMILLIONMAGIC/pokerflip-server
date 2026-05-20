@@ -340,6 +340,72 @@ app.post('/api/spin', async (req, res) => {
   }
 })
 
+// POST /api/payments/ton-verify — check blockchain for payment by ref comment
+app.post('/api/payments/ton-verify', async (req, res) => {
+  try {
+    const { initData, packageId, ref } = req.body as { initData?: string; packageId?: string; ref?: string }
+    if (!initData || !packageId || !ref) return res.status(400).json({ error: 'missing params' })
+
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'invalid initData' })
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
+
+    const WALLET = 'UQDDVM1Q9ZgEhz0XKpSelJ3tRTmU8VuU29Ls7ihMKH0ABAwT'
+    const TON_PACKAGES: Record<string, { chips: number; nanotons: number }> = {
+      pack10:  { chips:  10_000, nanotons: 500_000_000 },
+      pack30:  { chips:  30_000, nanotons: 1_000_000_000 },
+      pack100: { chips: 100_000, nanotons: 3_000_000_000 },
+      pack250: { chips: 250_000, nanotons: 6_000_000_000 },
+      pack500: { chips: 500_000, nanotons: 10_000_000_000 },
+    }
+    const pkg = TON_PACKAGES[packageId]
+    if (!pkg) return res.status(400).json({ error: 'unknown package' })
+
+    const db = getPool()
+
+    // Check already credited
+    const { rows: used } = await db.query('SELECT 1 FROM pf_ton_payments WHERE boc_hash=$1', [ref])
+    if (used.length > 0) return res.status(409).json({ error: 'already_used' })
+
+    // Query TON Center API for recent incoming transactions
+    const tonRes = await fetch(
+      `https://toncenter.com/api/v2/getTransactions?address=${WALLET}&limit=20&archival=false`,
+      { headers: { 'Content-Type': 'application/json' } }
+    )
+    const tonData = await tonRes.json() as any
+    if (!tonData.ok) return res.status(502).json({ error: 'blockchain unavailable' })
+
+    const tx = (tonData.result as any[]).find((t: any) => {
+      const msg = t.in_msg
+      if (!msg) return false
+      const comment = msg.message || ''
+      const value = Number(msg.value || 0)
+      return comment === ref && value >= pkg.nanotons * 0.95 // 5% tolerance
+    })
+
+    if (!tx) return res.json({ found: false })
+
+    // Found — credit chips
+    const txId = `toncenter_${tx.transaction_id?.hash || ref}`
+    await db.query(
+      'INSERT INTO pf_ton_payments (boc_hash, tg_id, package_id, chips) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING',
+      [txId, String(tgUser.id), packageId, pkg.chips]
+    )
+    const { rows } = await db.query(
+      'UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING chips',
+      [pkg.chips, String(tgUser.id)]
+    )
+    if (!rows[0]) return res.status(404).json({ error: 'user not found' })
+    await logTransaction(String(tgUser.id), 'purchase', pkg.chips, `Bought ${pkg.chips.toLocaleString()} chips (TON verified)`)
+
+    res.json({ found: true, chips: rows[0].chips })
+  } catch (e: any) {
+    console.error('ton-verify error:', e?.message || e)
+    res.status(500).json({ error: e?.message || 'server error' })
+  }
+})
+
 // POST /api/payments/ton-confirm — verify TON payment and credit chips
 app.post('/api/payments/ton-confirm', async (req, res) => {
   try {
