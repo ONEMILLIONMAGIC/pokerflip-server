@@ -6,11 +6,15 @@ const game_1 = require("./engine/game");
 const db_1 = require("./db");
 const tables = new Map();
 const clients = new Map();
-// Auto-start timer per table
 const startTimers = new Map();
-// Action timeout timers
 const actionTimers = new Map();
-const STARTING_CHIPS = 1000;
+const TABLE_CONFIG = {
+    main: { sb: 10, bb: 20, minBuyIn: 400 },
+    royal: { sb: 25, bb: 50, minBuyIn: 1000 },
+    obsidian: { sb: 100, bb: 200, minBuyIn: 5000 },
+    daily: { sb: 50, bb: 100, minBuyIn: 2000 },
+    weekly: { sb: 100, bb: 200, minBuyIn: 5000 },
+};
 const ACTION_TIMEOUT_MS = 30000;
 function setupWS(wss) {
     wss.on('connection', (ws) => {
@@ -31,23 +35,10 @@ function setupWS(wss) {
 function handleMessage(ws, msg) {
     const { type } = msg;
     if (type === 'join') {
-        const { tableId = 'main', playerId, playerName } = msg;
-        if (!playerId || !playerName)
-            return send(ws, { type: 'error', message: 'Need playerId and playerName' });
-        // Get or create table
-        if (!tables.has(tableId))
-            tables.set(tableId, (0, game_1.createTable)(tableId));
-        let state = tables.get(tableId);
-        // Find free seat (0-5)
-        const takenSeats = state.players.map(p => p.seatIndex);
-        const seat = [0, 1, 2, 3, 4, 5].find(s => !takenSeats.includes(s)) ?? 0;
-        state = (0, game_1.addPlayer)(state, playerId, playerName, STARTING_CHIPS, seat);
-        tables.set(tableId, state);
-        clients.set(ws, { ws, playerId, playerName, tableId });
-        broadcastTable(tableId);
-        send(ws, { type: 'joined', playerId, tableId, chips: STARTING_CHIPS });
-        // Auto-start if enough players
-        scheduleStart(tableId);
+        handleJoin(ws, msg).catch(e => {
+            console.error('Join error:', e);
+            send(ws, { type: 'error', message: 'Server error joining table' });
+        });
         return;
     }
     const client = clients.get(ws);
@@ -180,22 +171,58 @@ function send(ws, msg) {
     if (ws.readyState === ws_1.WebSocket.OPEN)
         ws.send(JSON.stringify(msg));
 }
+async function handleJoin(ws, msg) {
+    const { tableId = 'main', playerId, playerName } = msg;
+    if (!playerId || !playerName)
+        return send(ws, { type: 'error', message: 'Need playerId and playerName' });
+    const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main;
+    // Load chips from DB (fallback to minBuyIn if no DB)
+    let playerChips = config.minBuyIn;
+    if (process.env.DATABASE_URL) {
+        try {
+            const db = (0, db_1.getPool)();
+            const { rows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [playerId]);
+            if (rows[0])
+                playerChips = rows[0].chips;
+        }
+        catch (e) {
+            console.error('Failed to load chips:', e);
+        }
+    }
+    // Check min buy-in
+    if (playerChips < config.minBuyIn) {
+        return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips for this table`, code: 'insufficient_chips', required: config.minBuyIn, have: playerChips });
+    }
+    // Get or create table with correct blinds
+    if (!tables.has(tableId))
+        tables.set(tableId, (0, game_1.createTable)(tableId, config.sb, config.bb));
+    let state = tables.get(tableId);
+    // Find free seat
+    const takenSeats = state.players.map(p => p.seatIndex);
+    const seat = [0, 1, 2, 3, 4, 5].find(s => !takenSeats.includes(s)) ?? 0;
+    state = (0, game_1.addPlayer)(state, playerId, playerName, playerChips, seat);
+    tables.set(tableId, state);
+    clients.set(ws, { ws, playerId, playerName, tableId });
+    broadcastTable(tableId);
+    send(ws, { type: 'joined', playerId, tableId, chips: playerChips });
+    scheduleStart(tableId);
+}
 async function saveHandStats(state) {
     if (!process.env.DATABASE_URL)
         return;
     const db = (0, db_1.getPool)();
     const winnerIds = new Set(state.winners.map(w => w.playerId));
-    const pot = state.pot;
     for (const player of state.players) {
         if (!player.connected)
             continue;
         const isWinner = winnerIds.has(player.id);
         const wonAmount = state.winners.find(w => w.playerId === player.id)?.amount || 0;
         await db.query(`UPDATE pf_users SET
+        chips        = $1,
         hands_played = hands_played + 1,
-        hands_won    = hands_won + $1,
-        biggest_pot  = GREATEST(biggest_pot, $2)
-       WHERE tg_id = $3`, [isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]).catch(() => { });
+        hands_won    = hands_won + $2,
+        biggest_pot  = GREATEST(biggest_pot, $3)
+       WHERE tg_id = $4`, [player.chips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]).catch(() => { });
     }
-    console.log(`Hand stats saved: pot=${pot}, winners=${[...winnerIds].join(',')}`);
+    console.log(`Hand saved: winners=${[...winnerIds].join(',')}`);
 }

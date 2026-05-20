@@ -12,12 +12,16 @@ interface Client {
 const tables = new Map<string, GameState>()
 const clients = new Map<WebSocket, Client>()
 
-// Auto-start timer per table
 const startTimers = new Map<string, NodeJS.Timeout>()
-// Action timeout timers
 const actionTimers = new Map<string, NodeJS.Timeout>()
 
-const STARTING_CHIPS = 1000
+const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number }> = {
+  main:     { sb: 10,  bb: 20,  minBuyIn: 400 },
+  royal:    { sb: 25,  bb: 50,  minBuyIn: 1000 },
+  obsidian: { sb: 100, bb: 200, minBuyIn: 5000 },
+  daily:    { sb: 50,  bb: 100, minBuyIn: 2000 },
+  weekly:   { sb: 100, bb: 200, minBuyIn: 5000 },
+}
 const ACTION_TIMEOUT_MS = 30_000
 
 export function setupWS(wss: WebSocketServer) {
@@ -42,26 +46,10 @@ function handleMessage(ws: WebSocket, msg: any) {
   const { type } = msg
 
   if (type === 'join') {
-    const { tableId = 'main', playerId, playerName } = msg
-    if (!playerId || !playerName) return send(ws, { type: 'error', message: 'Need playerId and playerName' })
-
-    // Get or create table
-    if (!tables.has(tableId)) tables.set(tableId, createTable(tableId))
-    let state = tables.get(tableId)!
-
-    // Find free seat (0-5)
-    const takenSeats = state.players.map(p => p.seatIndex)
-    const seat = [0,1,2,3,4,5].find(s => !takenSeats.includes(s)) ?? 0
-
-    state = addPlayer(state, playerId, playerName, STARTING_CHIPS, seat)
-    tables.set(tableId, state)
-    clients.set(ws, { ws, playerId, playerName, tableId })
-
-    broadcastTable(tableId)
-    send(ws, { type: 'joined', playerId, tableId, chips: STARTING_CHIPS })
-
-    // Auto-start if enough players
-    scheduleStart(tableId)
+    handleJoin(ws, msg).catch(e => {
+      console.error('Join error:', e)
+      send(ws, { type: 'error', message: 'Server error joining table' })
+    })
     return
   }
 
@@ -187,11 +175,50 @@ function send(ws: WebSocket, msg: object) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
 }
 
+async function handleJoin(ws: WebSocket, msg: any) {
+  const { tableId = 'main', playerId, playerName } = msg
+  if (!playerId || !playerName) return send(ws, { type: 'error', message: 'Need playerId and playerName' })
+
+  const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main
+
+  // Load chips from DB (fallback to minBuyIn if no DB)
+  let playerChips = config.minBuyIn
+  if (process.env.DATABASE_URL) {
+    try {
+      const db = getPool()
+      const { rows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [playerId])
+      if (rows[0]) playerChips = rows[0].chips
+    } catch (e) {
+      console.error('Failed to load chips:', e)
+    }
+  }
+
+  // Check min buy-in
+  if (playerChips < config.minBuyIn) {
+    return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips for this table`, code: 'insufficient_chips', required: config.minBuyIn, have: playerChips })
+  }
+
+  // Get or create table with correct blinds
+  if (!tables.has(tableId)) tables.set(tableId, createTable(tableId, config.sb, config.bb))
+  let state = tables.get(tableId)!
+
+  // Find free seat
+  const takenSeats = state.players.map(p => p.seatIndex)
+  const seat = [0,1,2,3,4,5].find(s => !takenSeats.includes(s)) ?? 0
+
+  state = addPlayer(state, playerId, playerName, playerChips, seat)
+  tables.set(tableId, state)
+  clients.set(ws, { ws, playerId, playerName, tableId })
+
+  broadcastTable(tableId)
+  send(ws, { type: 'joined', playerId, tableId, chips: playerChips })
+  scheduleStart(tableId)
+}
+
 async function saveHandStats(state: GameState) {
   if (!process.env.DATABASE_URL) return
   const db = getPool()
   const winnerIds = new Set(state.winners.map(w => w.playerId))
-  const pot = state.pot
 
   for (const player of state.players) {
     if (!player.connected) continue
@@ -200,12 +227,13 @@ async function saveHandStats(state: GameState) {
 
     await db.query(
       `UPDATE pf_users SET
+        chips        = $1,
         hands_played = hands_played + 1,
-        hands_won    = hands_won + $1,
-        biggest_pot  = GREATEST(biggest_pot, $2)
-       WHERE tg_id = $3`,
-      [isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]
+        hands_won    = hands_won + $2,
+        biggest_pot  = GREATEST(biggest_pot, $3)
+       WHERE tg_id = $4`,
+      [player.chips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]
     ).catch(() => {})
   }
-  console.log(`Hand stats saved: pot=${pot}, winners=${[...winnerIds].join(',')}`)
+  console.log(`Hand saved: winners=${[...winnerIds].join(',')}`)
 }
