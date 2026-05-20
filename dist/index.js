@@ -19,8 +19,10 @@ app.get('/', (_req, res) => res.json({ status: 'PokerFlip server running ♠️'
 app.get('/tables', (_req, res) => {
     res.json((0, wsServer_1.getTableStats)());
 });
-// GET /api/tournaments — next occurrence times
-app.get('/api/tournaments', (_req, res) => {
+// Tournament registrations (in-memory, resets on redeploy)
+const tournamentRegs = new Map();
+const MIN_PLAYERS = 6;
+function getTournamentState() {
     const now = new Date();
     function nextDaily() {
         const d = new Date(now);
@@ -31,18 +33,54 @@ app.get('/api/tournaments', (_req, res) => {
     }
     function nextWeekly() {
         const d = new Date(now);
-        const day = d.getDay(); // 0=Sun
-        const daysUntilSun = day === 0 ? 7 : 7 - day;
+        const daysUntilSun = d.getDay() === 0 ? 7 : 7 - d.getDay();
         d.setDate(d.getDate() + daysUntilSun);
         d.setHours(21, 0, 0, 0);
         if (d <= now)
             d.setDate(d.getDate() + 7);
         return d;
     }
-    res.json({
-        daily: { nextAt: nextDaily().toISOString(), prize: '50,000', buyIn: '2,000' },
-        weekly: { nextAt: nextWeekly().toISOString(), prize: '500,000', buyIn: '5,000' },
-    });
+    const dailyRegs = tournamentRegs.get('daily')?.size || 0;
+    const weeklyRegs = tournamentRegs.get('weekly')?.size || 0;
+    return {
+        daily: { nextAt: nextDaily().toISOString(), prize: '50,000', buyIn: '2,000', registered: dailyRegs, minPlayers: MIN_PLAYERS, canStart: dailyRegs >= MIN_PLAYERS },
+        weekly: { nextAt: nextWeekly().toISOString(), prize: '500,000', buyIn: '5,000', registered: weeklyRegs, minPlayers: MIN_PLAYERS, canStart: weeklyRegs >= MIN_PLAYERS },
+    };
+}
+// GET /api/tournaments
+app.get('/api/tournaments', (_req, res) => res.json(getTournamentState()));
+// POST /api/tournaments/register
+app.post('/api/tournaments/register', async (req, res) => {
+    try {
+        const { initData, tournamentId } = req.body;
+        if (!initData || !tournamentId)
+            return res.status(400).json({ error: 'missing params' });
+        const params = (0, utils_1.validateTgInitData)(initData);
+        if (!params)
+            return res.status(403).json({ error: 'invalid initData' });
+        const tgUser = (0, utils_1.parseTgUser)(params);
+        if (!tgUser?.id)
+            return res.status(400).json({ error: 'no user' });
+        // Check buy-in
+        const buyIns = { daily: 2000, weekly: 5000 };
+        const cost = buyIns[tournamentId];
+        if (!cost)
+            return res.status(400).json({ error: 'unknown tournament' });
+        const db = (0, db_1.getPool)();
+        const { rows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [String(tgUser.id)]);
+        if (!rows[0] || rows[0].chips < cost)
+            return res.status(400).json({ error: 'insufficient_chips', required: cost });
+        // Deduct buy-in
+        await db.query('UPDATE pf_users SET chips = chips - $1 WHERE tg_id=$2', [cost, String(tgUser.id)]);
+        if (!tournamentRegs.has(tournamentId))
+            tournamentRegs.set(tournamentId, new Set());
+        tournamentRegs.get(tournamentId).add(String(tgUser.id));
+        res.json({ ok: true, ...getTournamentState() });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'server error' });
+    }
 });
 // POST /api/auth — upsert user, handle referral, return user
 app.post('/api/auth', async (req, res) => {
