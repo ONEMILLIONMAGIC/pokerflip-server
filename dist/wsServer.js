@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.setupWS = setupWS;
 const ws_1 = require("ws");
 const game_1 = require("./engine/game");
+const db_1 = require("./db");
 const tables = new Map();
 const clients = new Map();
 // Auto-start timer per table
@@ -58,12 +59,13 @@ function handleMessage(ws, msg) {
         let state = tables.get(tableId);
         if (!state)
             return;
+        const prevStreet = state.street;
         state = (0, game_1.applyAction)(state, playerId, action, amount);
         tables.set(tableId, state);
         clearActionTimer(tableId);
         broadcastTable(tableId);
-        if (state.street === 'showdown') {
-            // Start next hand after 4 seconds
+        if (state.street === 'showdown' && prevStreet !== 'showdown') {
+            saveHandStats(state).catch(e => console.error('stats error:', e));
             setTimeout(() => {
                 let s = tables.get(tableId);
                 if (!s)
@@ -177,4 +179,23 @@ function broadcastToTable(tableId, msg) {
 function send(ws, msg) {
     if (ws.readyState === ws_1.WebSocket.OPEN)
         ws.send(JSON.stringify(msg));
+}
+async function saveHandStats(state) {
+    if (!process.env.DATABASE_URL)
+        return;
+    const db = (0, db_1.getPool)();
+    const winnerIds = new Set(state.winners.map(w => w.playerId));
+    const pot = state.pot;
+    for (const player of state.players) {
+        if (!player.connected)
+            continue;
+        const isWinner = winnerIds.has(player.id);
+        const wonAmount = state.winners.find(w => w.playerId === player.id)?.amount || 0;
+        await db.query(`UPDATE pf_users SET
+        hands_played = hands_played + 1,
+        hands_won    = hands_won + $1,
+        biggest_pot  = GREATEST(biggest_pot, $2)
+       WHERE tg_id = $3`, [isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]).catch(() => { });
+    }
+    console.log(`Hand stats saved: pot=${pot}, winners=${[...winnerIds].join(',')}`);
 }

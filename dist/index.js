@@ -48,7 +48,7 @@ app.post('/api/auth', async (req, res) => {
             isNew ? referrerId : undefined]);
         // Credit referrer 10K chips once (only for new users)
         if (isNew && referrerId) {
-            await db.query(`UPDATE pf_users SET chips = chips + 10000, referrals_count = referrals_count + 1
+            await db.query(`UPDATE pf_users SET chips = chips + 3000, referrals_count = referrals_count + 1
          WHERE tg_id = $1`, [referrerId]);
         }
         res.json(rows[0]);
@@ -103,7 +103,7 @@ app.post('/api/claim', async (req, res) => {
             const nextIn = Math.ceil((6 - hoursSince) * 60);
             return res.status(429).json({ error: 'too_soon', nextInMinutes: nextIn });
         }
-        const { rows: updated } = await db.query(`UPDATE pf_users SET chips = chips + 1000, claimed_at = NOW()
+        const { rows: updated } = await db.query(`UPDATE pf_users SET chips = chips + 500, claimed_at = NOW()
        WHERE tg_id=$1 RETURNING *`, [String(tgUser.id)]);
         res.json(updated[0]);
     }

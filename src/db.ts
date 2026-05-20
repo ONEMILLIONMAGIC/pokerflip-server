@@ -24,7 +24,9 @@ export async function initDB() {
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `)
-  // Add referral columns if upgrading existing DB
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS referred_by TEXT`).catch(() => {})
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS referrals_count INTEGER NOT NULL DEFAULT 0`).catch(() => {})
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS hands_played INTEGER NOT NULL DEFAULT 0`).catch(() => {})
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS hands_won INTEGER NOT NULL DEFAULT 0`).catch(() => {})
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS biggest_pot INTEGER NOT NULL DEFAULT 0`).catch(() => {})
 }
