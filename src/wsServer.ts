@@ -224,27 +224,33 @@ export function getTableStats(): Record<string, { players: number; maxPlayers: n
 }
 
 async function handleJoin(ws: WebSocket, msg: any) {
-  const { tableId = 'main', playerId, playerName } = msg
+  const { tableId = 'main', playerId, playerName, buyIn: requestedBuyIn } = msg
   if (!playerId || !playerName) return send(ws, { type: 'error', message: 'Need playerId and playerName' })
 
   const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main
 
-  // Load chips from DB (fallback to minBuyIn if no DB)
-  let playerChips = config.minBuyIn
+  // Load total chips from DB
+  let totalChips = config.minBuyIn
   if (process.env.DATABASE_URL) {
     try {
       const db = getPool()
       const { rows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [playerId])
-      if (rows[0]) playerChips = rows[0].chips
+      if (rows[0]) totalChips = rows[0].chips
     } catch (e) {
       console.error('Failed to load chips:', e)
     }
   }
 
-  // Check min buy-in
-  if (playerChips < config.minBuyIn) {
-    return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips for this table`, code: 'insufficient_chips', required: config.minBuyIn, have: playerChips })
+  // Check min buy-in against total chips
+  if (totalChips < config.minBuyIn) {
+    return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips for this table`, code: 'insufficient_chips', required: config.minBuyIn, have: totalChips })
   }
+
+  // Use requested buy-in if valid, otherwise use total chips
+  const maxBuyIn = Math.min(totalChips, config.bigBlind * 200)
+  const playerChips = requestedBuyIn
+    ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips))
+    : Math.min(totalChips, maxBuyIn)
 
   // Get or create table with correct blinds
   if (!tables.has(tableId)) tables.set(tableId, createTable(tableId, config.sb, config.bb))
