@@ -44,7 +44,7 @@ function getTournamentState() {
 
   return {
     daily:  { nextAt: nextDaily().toISOString(),  prize: '50,000',  buyIn: '2,000', registered: dailyRegs,  minPlayers: MIN_PLAYERS, canStart: dailyRegs >= MIN_PLAYERS },
-    weekly: { nextAt: nextWeekly().toISOString(), prize: '500,000', buyIn: '5,000', registered: weeklyRegs, minPlayers: MIN_PLAYERS, canStart: weeklyRegs >= MIN_PLAYERS },
+    weekly: { nextAt: nextWeekly().toISOString(), prize: '300,000', buyIn: '5,000', registered: weeklyRegs, minPlayers: MIN_PLAYERS, canStart: weeklyRegs >= MIN_PLAYERS },
   }
 }
 
