@@ -151,6 +151,10 @@ app.post('/api/auth', async (req, res) => {
         if (isNew && referrerId) {
             await db.query(`UPDATE pf_users SET chips = chips + 3000, referrals_count = referrals_count + 1 WHERE tg_id=$1`, [referrerId]);
         }
+        // Fetch real photo via Bot API (background, don't await)
+        if (process.env.BOT_TOKEN) {
+            fetchAndSavePhoto(tgId, process.env.BOT_TOKEN).catch(() => { });
+        }
         // Daily streak bonus
         const today = new Date().toISOString().slice(0, 10);
         const user = rows[0];
@@ -358,6 +362,23 @@ app.post('/api/payments/stars-confirm', async (req, res) => {
         res.status(500).json({ error: 'server error' });
     }
 });
+async function fetchAndSavePhoto(tgId, botToken) {
+    try {
+        const r1 = await fetch(`https://api.telegram.org/bot${botToken}/getUserProfilePhotos?user_id=${tgId}&limit=1`);
+        const d1 = await r1.json();
+        if (!d1.ok || !d1.result?.photos?.length)
+            return;
+        const fileId = d1.result.photos[0][2]?.file_id || d1.result.photos[0][0]?.file_id;
+        const r2 = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
+        const d2 = await r2.json();
+        if (!d2.ok || !d2.result?.file_path)
+            return;
+        const photoUrl = `https://api.telegram.org/file/bot${botToken}/${d2.result.file_path}`;
+        const db = (0, db_1.getPool)();
+        await db.query('UPDATE pf_users SET photo_url=$1 WHERE tg_id=$2', [photoUrl, tgId]);
+    }
+    catch { }
+}
 const server = (0, http_1.createServer)(app);
 const wss = new ws_1.WebSocketServer({ server });
 (0, wsServer_1.setupWS)(wss);
