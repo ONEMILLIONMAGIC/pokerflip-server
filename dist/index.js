@@ -188,9 +188,10 @@ app.post('/api/spin', async (req, res) => {
             return res.status(429).json({ error: 'too_soon', nextInMinutes: nextIn });
         }
         // Generate prize: 1% → 10000, 99% → 200–1000
+        const prizes = [200, 300, 400, 500, 800, 1000];
         const prize = Math.random() < 0.01
             ? 10000
-            : Math.floor(Math.random() * 801) + 200;
+            : prizes[Math.floor(Math.random() * prizes.length)];
         const { rows: updated } = await db.query(`UPDATE pf_users SET chips = chips + $1, last_spin_at = NOW() WHERE tg_id=$2 RETURNING *`, [prize, String(tgUser.id)]);
         await (0, db_1.logTransaction)(String(tgUser.id), 'spin', prize, `Daily spin: won ${prize.toLocaleString()} chips`);
         res.json({ prize, chips: updated[0].chips, jackpot: prize === 10000 });
