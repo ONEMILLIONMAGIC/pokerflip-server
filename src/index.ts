@@ -69,15 +69,17 @@ app.post('/api/auth', async (req, res) => {
   }
 })
 
-// GET /api/leaderboard
-app.get('/api/leaderboard', async (_req, res) => {
+// GET /api/leaderboard?period=all|weekly
+app.get('/api/leaderboard', async (req, res) => {
   try {
     const db = getPool()
+    const weekly = req.query.period === 'weekly'
     const { rows } = await db.query(`
-      SELECT tg_id, first_name, username, chips, hands_played, hands_won, biggest_pot,
+      SELECT tg_id, first_name, username, photo_url, chips, hands_played, hands_won, biggest_pot,
         (hands_played * 10 + hands_won * 30 + biggest_pot / 500) AS xp
       FROM pf_users
-      ORDER BY xp DESC, chips DESC
+      ${weekly ? "WHERE created_at >= NOW() - INTERVAL '7 days'" : ''}
+      ORDER BY (hands_played * 10 + hands_won * 30 + biggest_pot / 500) DESC, chips DESC
       LIMIT 50
     `)
     res.json(rows)
