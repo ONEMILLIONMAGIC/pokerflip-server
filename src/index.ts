@@ -116,7 +116,7 @@ app.post('/api/auth', async (req, res) => {
        ON CONFLICT (tg_id) DO UPDATE SET
          username   = EXCLUDED.username,
          first_name = EXCLUDED.first_name,
-         photo_url  = EXCLUDED.photo_url
+         photo_url  = COALESCE(EXCLUDED.photo_url, pf_users.photo_url)
        RETURNING *`,
       [tgId, tgUser.username || null, tgUser.first_name || null, tgUser.photo_url || null,
        isNew ? referrerId : undefined]
