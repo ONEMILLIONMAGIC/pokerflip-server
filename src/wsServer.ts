@@ -14,6 +14,7 @@ const clients = new Map<WebSocket, Client>()
 
 const startTimers = new Map<string, NodeJS.Timeout>()
 const actionTimers = new Map<string, NodeJS.Timeout>()
+const afkTimers = new Map<string, NodeJS.Timeout>() // key: tableId:playerId
 
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
   // NL Hold'em
@@ -126,19 +127,65 @@ function handleDisconnect(ws: WebSocket) {
   let state = tables.get(tableId)
   if (!state) return
 
-  // Save chips before removing player
+  // Save chips immediately
   const player = state.players.find(p => p.id === playerId)
   if (player && process.env.DATABASE_URL) {
-    getPool().query(
-      'UPDATE pf_users SET chips = $1 WHERE tg_id = $2',
-      [player.chips, playerId]
-    ).catch(e => console.error('Failed to save chips on disconnect:', e))
+    getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [player.chips, playerId])
+      .catch(e => console.error('Failed to save chips on disconnect:', e))
   }
 
+  // Mark as AFK/disconnected (not removed yet — give 30s to reconnect)
   state = removePlayer(state, playerId)
   tables.set(tableId, state)
   broadcastTable(tableId)
-  console.log(`Player ${playerId} disconnected from ${tableId}, chips saved: ${player?.chips}`)
+
+  // If it's their turn right now, auto-fold after 3s
+  const isTheirTurn = state.players[state.actionIdx]?.id === playerId
+  if (isTheirTurn && state.street !== 'waiting' && state.street !== 'showdown') {
+    setTimeout(() => {
+      let s = tables.get(tableId)
+      if (!s || s.players[s.actionIdx]?.id !== playerId) return
+      s = applyAction(s, playerId, 'fold')
+      tables.set(tableId, s)
+      clearActionTimer(tableId)
+      broadcastTable(tableId)
+      if (s.street === 'showdown') {
+        saveHandStats(s).catch(console.error)
+        setTimeout(() => {
+          let s2 = tables.get(tableId)
+          if (!s2) return
+          s2 = canStart(s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
+          tables.set(tableId, s2)
+          broadcastTable(tableId)
+          setActionTimer(tableId)
+        }, 4000)
+      } else {
+        setActionTimer(tableId)
+      }
+    }, 3000)
+  }
+
+  // After 30s without reconnect — actually remove the player slot
+  const afkKey = `${tableId}:${playerId}`
+  const existingAfk = afkTimers.get(afkKey)
+  if (existingAfk) clearTimeout(existingAfk)
+
+  const afkTimer = setTimeout(() => {
+    afkTimers.delete(afkKey)
+    let s = tables.get(tableId)
+    if (!s) return
+    const p = s.players.find(pp => pp.id === playerId)
+    if (p && !p.connected) {
+      // Still not reconnected — remove slot so others can join
+      s.players = s.players.filter(pp => pp.id !== playerId)
+      tables.set(tableId, s)
+      broadcastTable(tableId)
+      console.log(`Player ${playerId} AFK timeout — removed from ${tableId}`)
+    }
+  }, 30_000)
+  afkTimers.set(afkKey, afkTimer)
+
+  console.log(`Player ${playerId} disconnected (AFK timer started), chips: ${player?.chips}`)
 }
 
 function scheduleStart(tableId: string) {
@@ -252,9 +299,26 @@ async function handleJoin(ws: WebSocket, msg: any) {
     ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips))
     : Math.min(totalChips, maxBuyIn)
 
+  // Cancel any pending AFK removal timer for this player
+  const afkKey = `${tableId}:${playerId}`
+  const pendingAfk = afkTimers.get(afkKey)
+  if (pendingAfk) { clearTimeout(pendingAfk); afkTimers.delete(afkKey) }
+
   // Get or create table with correct blinds
   if (!tables.has(tableId)) tables.set(tableId, createTable(tableId, config.sb, config.bb))
   let state = tables.get(tableId)!
+
+  // Handle reconnection — player already at this table but disconnected
+  const reconnectingPlayer = state.players.find(p => p.id === playerId && !p.connected)
+  if (reconnectingPlayer) {
+    state = addPlayer(state, playerId, playerName, reconnectingPlayer.chips, reconnectingPlayer.seatIndex)
+    tables.set(tableId, state)
+    clients.set(ws, { ws, playerId, playerName, tableId })
+    broadcastTable(tableId)
+    send(ws, { type: 'joined', playerId, tableId, chips: reconnectingPlayer.chips, maxPlayers })
+    console.log(`Player ${playerId} reconnected to ${tableId} with ${reconnectingPlayer.chips} chips`)
+    return
+  }
 
   // Check max players
   const maxPlayers = config.maxPlayers || 6
