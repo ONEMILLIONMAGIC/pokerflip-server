@@ -713,22 +713,62 @@ app.post('/api/admin/credit', async (req, res) => {
   }
 })
 
+// Fetch photo file_id from Bot API and store it (file_id doesn't expire)
 async function fetchAndSavePhoto(tgId: string, botToken: string) {
   try {
     const r1 = await fetch(`https://api.telegram.org/bot${botToken}/getUserProfilePhotos?user_id=${tgId}&limit=1`)
     const d1 = await r1.json() as any
     if (!d1.ok || !d1.result?.photos?.length) return
 
+    // Store the file_id (permanent) instead of the expiring file URL
     const fileId = d1.result.photos[0][2]?.file_id || d1.result.photos[0][0]?.file_id
-    const r2 = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`)
-    const d2 = await r2.json() as any
-    if (!d2.ok || !d2.result?.file_path) return
-
-    const photoUrl = `https://api.telegram.org/file/bot${botToken}/${d2.result.file_path}`
+    if (!fileId) return
     const db = getPool()
-    await db.query('UPDATE pf_users SET photo_url=$1 WHERE tg_id=$2', [photoUrl, tgId])
+    await db.query('UPDATE pf_users SET photo_url=$1 WHERE tg_id=$2', [`tgfile:${fileId}`, tgId])
   } catch {}
 }
+
+// GET /api/avatar/:tgId — proxy Telegram profile photo (keeps bot token server-side)
+app.get('/api/avatar/:tgId', async (req, res) => {
+  try {
+    const { tgId } = req.params
+    const botToken = process.env.BOT_TOKEN
+    if (!botToken) return res.status(404).end()
+
+    const db = getPool()
+    const { rows } = await db.query('SELECT photo_url FROM pf_users WHERE tg_id=$1', [tgId])
+    let fileId: string | null = null
+
+    if (rows[0]?.photo_url?.startsWith('tgfile:')) {
+      fileId = rows[0].photo_url.slice(7) // strip 'tgfile:' prefix
+    } else {
+      // Fall back to fetching fresh
+      const r1 = await fetch(`https://api.telegram.org/bot${botToken}/getUserProfilePhotos?user_id=${tgId}&limit=1`)
+      const d1 = await r1.json() as any
+      if (!d1.ok || !d1.result?.photos?.length) return res.status(404).end()
+      fileId = d1.result.photos[0][2]?.file_id || d1.result.photos[0][0]?.file_id
+      if (fileId) {
+        await db.query('UPDATE pf_users SET photo_url=$1 WHERE tg_id=$2', [`tgfile:${fileId}`, tgId]).catch(() => {})
+      }
+    }
+
+    if (!fileId) return res.status(404).end()
+
+    const r2 = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`)
+    const d2 = await r2.json() as any
+    if (!d2.ok || !d2.result?.file_path) return res.status(404).end()
+
+    const imgResp = await fetch(`https://api.telegram.org/file/bot${botToken}/${d2.result.file_path}`)
+    if (!imgResp.ok) return res.status(404).end()
+
+    res.setHeader('Content-Type', imgResp.headers.get('content-type') || 'image/jpeg')
+    res.setHeader('Cache-Control', 'public, max-age=3600')
+    const buf = Buffer.from(await imgResp.arrayBuffer())
+    res.send(buf)
+  } catch {
+    res.status(404).end()
+  }
+})
 
 const server = createServer(app)
 const wss = new WebSocketServer({ server })
