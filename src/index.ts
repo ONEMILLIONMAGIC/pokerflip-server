@@ -93,6 +93,5 @@ const wss = new WebSocketServer({ server })
 setupWS(wss)
 
 const PORT = process.env.PORT || 3002
-initDB()
-  .then(() => server.listen(PORT, () => console.log(`\n♠️ PokerFlip server → http://localhost:${PORT}\n   WebSocket → ws://localhost:${PORT}\n`)))
-  .catch(e => { console.error('DB init failed:', e); process.exit(1) })
+server.listen(PORT, () => console.log(`\n♠️ PokerFlip server → http://localhost:${PORT}\n   WebSocket → ws://localhost:${PORT}\n`))
+initDB().catch(e => console.error('DB init warning:', e))
