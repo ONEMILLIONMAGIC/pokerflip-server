@@ -254,7 +254,7 @@ async function handleJoin(ws: WebSocket, msg: any) {
   clients.set(ws, { ws, playerId, playerName, tableId })
 
   broadcastTable(tableId)
-  send(ws, { type: 'joined', playerId, tableId, chips: playerChips })
+  send(ws, { type: 'joined', playerId, tableId, chips: playerChips, maxPlayers })
   scheduleStart(tableId)
 }
 
