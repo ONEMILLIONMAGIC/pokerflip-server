@@ -247,7 +247,7 @@ async function handleJoin(ws: WebSocket, msg: any) {
   }
 
   // Use requested buy-in if valid, otherwise use total chips
-  const maxBuyIn = Math.min(totalChips, config.bigBlind * 200)
+  const maxBuyIn = Math.min(totalChips, config.bb * 200)
   const playerChips = requestedBuyIn
     ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips))
     : Math.min(totalChips, maxBuyIn)
