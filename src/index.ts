@@ -172,26 +172,50 @@ app.post('/api/auth', async (req, res) => {
       fetchAndSavePhoto(tgId, process.env.BOT_TOKEN).catch(() => {})
     }
 
-    // Daily streak bonus
-    const today = new Date().toISOString().slice(0, 10)
     const user = rows[0]
-    const lastLogin = user.last_login_date ? String(user.last_login_date).slice(0, 10) : null
+    // Check if spin is available (for client to show popup)
+    const canSpin = !user.last_spin_at ||
+      (Date.now() - new Date(user.last_spin_at).getTime()) >= 86_400_000
 
-    if (lastLogin !== today) {
-      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
-      const newStreak = lastLogin === yesterday ? (user.streak_days || 0) + 1 : 1
-      const bonus = Math.min(300 + (newStreak - 1) * 100, 1000) // 300 day1 → +100 per day → max 1000
+    res.json({ ...user, can_spin: canSpin })
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'server error' })
+  }
+})
 
-      const { rows: updated } = await db.query(
-        `UPDATE pf_users SET chips = chips + $1, streak_days = $2, last_login_date = $3
-         WHERE tg_id = $4 RETURNING *`,
-        [bonus, newStreak, today, tgId]
-      )
-      await logTransaction(tgId, 'streak', bonus, `Day ${newStreak} login bonus`)
-      return res.json({ ...updated[0], streak_bonus: bonus, streak_days: newStreak })
+// POST /api/spin — daily fortune wheel
+app.post('/api/spin', async (req, res) => {
+  try {
+    const { initData } = req.body as { initData?: string }
+    if (!initData) return res.status(400).json({ error: 'no initData' })
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'invalid' })
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
+
+    const db = getPool()
+    const { rows } = await db.query('SELECT last_spin_at FROM pf_users WHERE tg_id=$1', [String(tgUser.id)])
+    if (!rows[0]) return res.status(404).json({ error: 'user not found' })
+
+    const lastSpin = rows[0].last_spin_at
+    if (lastSpin && (Date.now() - new Date(lastSpin).getTime()) < 86_400_000) {
+      const nextIn = Math.ceil((86_400_000 - (Date.now() - new Date(lastSpin).getTime())) / 60_000)
+      return res.status(429).json({ error: 'too_soon', nextInMinutes: nextIn })
     }
 
-    res.json(rows[0])
+    // Generate prize: 1% → 10000, 99% → 200–1000
+    const prize = Math.random() < 0.01
+      ? 10000
+      : Math.floor(Math.random() * 801) + 200
+
+    const { rows: updated } = await db.query(
+      `UPDATE pf_users SET chips = chips + $1, last_spin_at = NOW() WHERE tg_id=$2 RETURNING *`,
+      [prize, String(tgUser.id)]
+    )
+    await logTransaction(String(tgUser.id), 'spin', prize, `Daily spin: won ${prize.toLocaleString()} chips`)
+
+    res.json({ prize, chips: updated[0].chips, jackpot: prize === 10000 })
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'server error' })
