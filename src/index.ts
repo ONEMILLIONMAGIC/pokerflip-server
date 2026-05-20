@@ -586,6 +586,26 @@ app.post('/api/payments/stars-confirm', async (req, res) => {
   }
 })
 
+// POST /api/admin/credit — manual chip credit (protected by ADMIN_SECRET)
+app.post('/api/admin/credit', async (req, res) => {
+  const secret = req.headers['x-admin-secret']
+  if (!secret || secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'forbidden' })
+  try {
+    const { tgId, chips, reason } = req.body as { tgId?: string; chips?: number; reason?: string }
+    if (!tgId || !chips || chips <= 0) return res.status(400).json({ error: 'missing params' })
+    const db = getPool()
+    const { rows } = await db.query(
+      'UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING *',
+      [chips, tgId]
+    )
+    if (!rows[0]) return res.status(404).json({ error: 'user not found' })
+    await logTransaction(tgId, 'admin', chips, reason || 'Manual admin credit')
+    res.json({ ok: true, chips: rows[0].chips })
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'server error' })
+  }
+})
+
 async function fetchAndSavePhoto(tgId: string, botToken: string) {
   try {
     const r1 = await fetch(`https://api.telegram.org/bot${botToken}/getUserProfilePhotos?user_id=${tgId}&limit=1`)
