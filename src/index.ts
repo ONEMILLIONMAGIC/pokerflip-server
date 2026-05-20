@@ -16,6 +16,19 @@ app.use(express.json())
 
 app.get('/', (_req, res) => res.json({ status: 'PokerFlip server running ♠️' }))
 
+const TMA_URL = 'https://pokerflip-client.onrender.com'
+const PLAY_BTN = { inline_keyboard: [[{ text: '♠️ Play Now', web_app: { url: TMA_URL } }]] }
+
+async function tgSend(chatId: number | string, text: string, extra: object = {}) {
+  const botToken = process.env.BOT_TOKEN
+  if (!botToken) return
+  await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', ...extra })
+  }).catch(() => {})
+}
+
 // Telegram bot webhook
 app.post('/api/webhook', async (req, res) => {
   res.sendStatus(200)
@@ -25,30 +38,111 @@ app.post('/api/webhook', async (req, res) => {
     if (!msg) return
 
     const chatId = msg.chat.id
-    const text = msg.text || ''
+    const tgId = String(msg.from?.id || chatId)
+    const text = (msg.text || '').trim()
     const firstName = msg.from?.first_name || 'Player'
 
     if (text.startsWith('/start')) {
-      const botToken = process.env.BOT_TOKEN
-      if (!botToken) return
-
-      await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: `♠️ Welcome to *PokerFlip*, ${firstName}!\n\nPlay Texas Hold'em poker with free chips.\n\n🎁 *3,000 chips* to start\n⏰ Claim *+500 chips* every 6 hours\n🔥 Daily login bonus (up to 1,000/day)\n👥 Invite friends → *+3,000 chips* each\n\nJoin tables, climb the leaderboard, win tournaments!`,
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[
-              { text: '♠️ Play Now', web_app: { url: 'https://pokerflip-client.onrender.com' } }
-            ]]
-          }
-        })
-      })
+      await tgSend(chatId,
+        `♠️ Welcome to *PokerFlip*, ${firstName}!\n\nPlay Texas Hold'em poker with free chips.\n\n🎁 *3,000 chips* to start\n⏰ Claim *+500 chips* every 6 hours\n🎰 Daily spin wheel — up to *50,000 chips*!\n👥 Invite friends → *+3,000 chips* each\n\nJoin tables, climb the leaderboard, win tournaments!`,
+        { reply_markup: PLAY_BTN })
     }
+
+    else if (text === '/stats' || text === '/balance') {
+      const db = getPool()
+      const { rows } = await db.query(
+        'SELECT chips, hands_played, hands_won, biggest_pot, streak_days FROM pf_users WHERE tg_id=$1', [tgId]
+      )
+      if (!rows[0]) return tgSend(chatId, '❌ You need to open the app first!', { reply_markup: PLAY_BTN })
+      const u = rows[0]
+      const wr = u.hands_played > 0 ? Math.round(u.hands_won / u.hands_played * 100) : 0
+      const xp = u.hands_played * 10 + u.hands_won * 30 + Math.floor(u.biggest_pot / 500)
+      await tgSend(chatId,
+        `♠️ *Your PokerFlip Stats*\n\n` +
+        `💰 Balance: *${u.chips.toLocaleString()} chips*\n` +
+        `🃏 Hands played: *${u.hands_played}*\n` +
+        `🏆 Win rate: *${wr}%*\n` +
+        `💎 Biggest pot: *${u.biggest_pot.toLocaleString()}*\n` +
+        `⚡ XP: *${xp.toLocaleString()}*\n` +
+        `🔥 Streak: *${u.streak_days} days*`,
+        { reply_markup: PLAY_BTN })
+    }
+
+    else if (text === '/referral') {
+      const db = getPool()
+      const { rows } = await db.query('SELECT referrals_count FROM pf_users WHERE tg_id=$1', [tgId])
+      const count = rows[0]?.referrals_count || 0
+      const link = `https://t.me/pokerflip_bot?start=${tgId}`
+      await tgSend(chatId,
+        `👥 *Your Referral Link*\n\n` +
+        `${link}\n\n` +
+        `Friends joined: *${count}*\n` +
+        `Earned: *${(count * 3000).toLocaleString()} chips*\n\n` +
+        `Each friend gives you *+3,000 chips*!`)
+    }
+
+    else if (text === '/claim') {
+      await tgSend(chatId, '⏰ Open the app to claim your free chips!', { reply_markup: PLAY_BTN })
+    }
+
+    else if (text === '/spin') {
+      await tgSend(chatId, '🎰 Open the app to spin the daily wheel!', { reply_markup: PLAY_BTN })
+    }
+
+    else if (text === '/help') {
+      await tgSend(chatId,
+        `♠️ *PokerFlip Commands*\n\n` +
+        `/stats — your statistics\n` +
+        `/balance — chip balance\n` +
+        `/referral — your referral link\n` +
+        `/claim — claim free chips\n` +
+        `/spin — daily spin wheel\n` +
+        `/help — this message`)
+    }
+
   } catch (e) {
     console.error('Webhook error:', e)
+  }
+})
+
+// GET /api/notify — send push notifications to users who haven't been active
+app.get('/api/notify', async (req, res) => {
+  const secret = req.headers['x-notify-secret']
+  if (secret !== process.env.NOTIFY_SECRET && secret !== 'pokerflip-notify-2026') {
+    return res.status(403).json({ error: 'forbidden' })
+  }
+  try {
+    const db = getPool()
+    // Users who haven't logged in for 20-48 hours and have claimable chips
+    const { rows } = await db.query(`
+      SELECT tg_id, first_name, chips, claimed_at, last_spin_at
+      FROM pf_users
+      WHERE last_login_date < CURRENT_DATE - INTERVAL '1 day'
+        AND last_login_date >= CURRENT_DATE - INTERVAL '3 days'
+      LIMIT 200
+    `)
+
+    let sent = 0
+    for (const u of rows) {
+      const canClaim = !u.claimed_at || Date.now() - new Date(u.claimed_at).getTime() >= 6 * 3600000
+      const canSpin = !u.last_spin_at || Date.now() - new Date(u.last_spin_at).getTime() >= 86400000
+      if (!canClaim && !canSpin) continue
+
+      const parts = []
+      if (canClaim) parts.push('⏰ Free chips ready to claim!')
+      if (canSpin) parts.push('🎰 Daily spin wheel available!')
+
+      await tgSend(u.tg_id,
+        `👋 Hey ${u.first_name || 'Player'}!\n\n${parts.join('\n')}\n\nYou have *${u.chips.toLocaleString()} chips* waiting.`,
+        { reply_markup: PLAY_BTN }
+      )
+      sent++
+      await new Promise(r => setTimeout(r, 100)) // rate limit
+    }
+    res.json({ ok: true, sent })
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'server error' })
   }
 })
 

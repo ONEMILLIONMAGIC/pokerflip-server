@@ -1,15 +1,25 @@
-name: Keep Alive
+name: Keep Alive & Notify
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/10 * * * *'   # keep-alive every 10 min
+    - cron: '0 9 * * *'      # daily notifications at 9:00 UTC
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping PokerFlip server
+      - name: Ping servers
         run: |
-          curl -sf https://pokerflip-server.onrender.com/ || echo "Server starting up..."
-          curl -sf https://pokerflip-client.onrender.com/ || echo "Client starting up..."
+          curl -sf https://pokerflip-server.onrender.com/ || echo "Server waking up..."
+          curl -sf https://pokerflip-client.onrender.com/ || echo "Client waking up..."
+
+  notify:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 9 * * *' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Send daily notifications
+        run: |
+          curl -sf -H "x-notify-secret: pokerflip-notify-2026" \
+            https://pokerflip-server.onrender.com/api/notify || echo "Notify done"
