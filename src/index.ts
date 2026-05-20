@@ -195,13 +195,26 @@ app.post('/api/spin', async (req, res) => {
     if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
 
     const db = getPool()
-    const { rows } = await db.query('SELECT last_spin_at FROM pf_users WHERE tg_id=$1', [String(tgUser.id)])
-    if (!rows[0]) return res.status(404).json({ error: 'user not found' })
+    // Ensure user exists (in case of race condition on first login)
+    const { rows } = await db.query('SELECT last_spin_at, chips FROM pf_users WHERE tg_id=$1', [String(tgUser.id)])
+    if (!rows[0]) {
+      // Try upsert minimal user record and retry
+      await db.query(
+        `INSERT INTO pf_users (tg_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+        [String(tgUser.id)]
+      )
+      const { rows: retry } = await db.query('SELECT last_spin_at FROM pf_users WHERE tg_id=$1', [String(tgUser.id)])
+      if (!retry[0]) return res.status(404).json({ error: 'user not found' })
+      rows.push(retry[0])
+    }
 
     const lastSpin = rows[0].last_spin_at
-    if (lastSpin && (Date.now() - new Date(lastSpin).getTime()) < 86_400_000) {
-      const nextIn = Math.ceil((86_400_000 - (Date.now() - new Date(lastSpin).getTime())) / 60_000)
-      return res.status(429).json({ error: 'too_soon', nextInMinutes: nextIn })
+    if (lastSpin) {
+      const elapsed = Date.now() - new Date(lastSpin).getTime()
+      if (elapsed < 86_400_000) {
+        const nextIn = Math.ceil((86_400_000 - elapsed) / 60_000)
+        return res.status(429).json({ error: 'too_soon', nextInMinutes: nextIn })
+      }
     }
 
     // Generate prize: 1% → 10000, 99% → 200–1000
