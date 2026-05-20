@@ -179,16 +179,11 @@ app.post('/api/spin', async (req, res) => {
         if (!tgUser?.id)
             return res.status(400).json({ error: 'no user' });
         const db = (0, db_1.getPool)();
-        // Ensure user exists (in case of race condition on first login)
+        // Ensure column exists
+        await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS last_spin_at TIMESTAMPTZ`).catch(() => { });
         const { rows } = await db.query('SELECT last_spin_at, chips FROM pf_users WHERE tg_id=$1', [String(tgUser.id)]);
-        if (!rows[0]) {
-            // Try upsert minimal user record and retry
-            await db.query(`INSERT INTO pf_users (tg_id) VALUES ($1) ON CONFLICT DO NOTHING`, [String(tgUser.id)]);
-            const { rows: retry } = await db.query('SELECT last_spin_at FROM pf_users WHERE tg_id=$1', [String(tgUser.id)]);
-            if (!retry[0])
-                return res.status(404).json({ error: 'user not found' });
-            rows.push(retry[0]);
-        }
+        if (!rows[0])
+            return res.status(404).json({ error: 'user not found — open app first' });
         const lastSpin = rows[0].last_spin_at;
         if (lastSpin) {
             const elapsed = Date.now() - new Date(lastSpin).getTime();
@@ -197,14 +192,15 @@ app.post('/api/spin', async (req, res) => {
                 return res.status(429).json({ error: 'too_soon', nextInMinutes: nextIn });
             }
         }
-        // Generate prize: 1% → 10000, 99% → 200–1000
+        // 0.1% → 50000, 1% → 10000, rest → 200-1000
+        const rand = Math.random();
         const prizes = [200, 300, 400, 500, 800, 1000];
-        const prize = Math.random() < 0.01
-            ? 10000
-            : prizes[Math.floor(Math.random() * prizes.length)];
+        const prize = rand < 0.001 ? 50000
+            : rand < 0.011 ? 10000
+                : prizes[Math.floor(Math.random() * prizes.length)];
         const { rows: updated } = await db.query(`UPDATE pf_users SET chips = chips + $1, last_spin_at = NOW() WHERE tg_id=$2 RETURNING *`, [prize, String(tgUser.id)]);
         await (0, db_1.logTransaction)(String(tgUser.id), 'spin', prize, `Daily spin: won ${prize.toLocaleString()} chips`);
-        res.json({ prize, chips: updated[0].chips, jackpot: prize === 10000 });
+        res.json({ prize, chips: updated[0].chips, jackpot: prize >= 10000 });
     }
     catch (e) {
         console.error(e);
