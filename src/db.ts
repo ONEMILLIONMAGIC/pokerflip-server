@@ -29,4 +29,5 @@ export async function initDB() {
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS hands_played INTEGER NOT NULL DEFAULT 0`).catch(() => {})
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS hands_won INTEGER NOT NULL DEFAULT 0`).catch(() => {})
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS biggest_pot INTEGER NOT NULL DEFAULT 0`).catch(() => {})
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS tournaments_won INTEGER NOT NULL DEFAULT 0`).catch(() => {})
 }
