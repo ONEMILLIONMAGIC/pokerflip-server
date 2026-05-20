@@ -56,7 +56,7 @@ app.post('/api/auth', async (req, res) => {
     // Credit referrer 10K chips once (only for new users)
     if (isNew && referrerId) {
       await db.query(
-        `UPDATE pf_users SET chips = chips + 10000, referrals_count = referrals_count + 1
+        `UPDATE pf_users SET chips = chips + 3000, referrals_count = referrals_count + 1
          WHERE tg_id = $1`,
         [referrerId]
       )
@@ -120,7 +120,7 @@ app.post('/api/claim', async (req, res) => {
     }
 
     const { rows: updated } = await db.query(
-      `UPDATE pf_users SET chips = chips + 1000, claimed_at = NOW()
+      `UPDATE pf_users SET chips = chips + 500, claimed_at = NOW()
        WHERE tg_id=$1 RETURNING *`,
       [String(tgUser.id)]
     )
