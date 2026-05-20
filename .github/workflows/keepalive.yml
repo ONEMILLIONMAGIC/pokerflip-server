@@ -1,0 +1,15 @@
+name: Keep Alive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping PokerFlip server
+        run: |
+          curl -sf https://pokerflip-server.onrender.com/ || echo "Server starting up..."
+          curl -sf https://pokerflip-client.onrender.com/ || echo "Client starting up..."

@@ -122,13 +122,31 @@ app.post('/api/auth', async (req, res) => {
        isNew ? referrerId : undefined]
     )
 
-    // Credit referrer 10K chips once (only for new users)
+    // Credit referrer once for new users
     if (isNew && referrerId) {
       await db.query(
-        `UPDATE pf_users SET chips = chips + 3000, referrals_count = referrals_count + 1
-         WHERE tg_id = $1`,
+        `UPDATE pf_users SET chips = chips + 3000, referrals_count = referrals_count + 1 WHERE tg_id=$1`,
         [referrerId]
       )
+    }
+
+    // Daily streak bonus
+    const today = new Date().toISOString().slice(0, 10)
+    const user = rows[0]
+    const lastLogin = user.last_login_date ? String(user.last_login_date).slice(0, 10) : null
+
+    if (lastLogin !== today) {
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+      const newStreak = lastLogin === yesterday ? (user.streak_days || 0) + 1 : 1
+      const bonus = Math.min(300 + (newStreak - 1) * 100, 1000) // 300 day1 → +100 per day → max 1000
+
+      const { rows: updated } = await db.query(
+        `UPDATE pf_users SET chips = chips + $1, streak_days = $2, last_login_date = $3
+         WHERE tg_id = $4 RETURNING *`,
+        [bonus, newStreak, today, tgId]
+      )
+      await logTransaction(tgId, 'streak', bonus, `Day ${newStreak} login bonus`)
+      return res.json({ ...updated[0], streak_bonus: bonus, streak_days: newStreak })
     }
 
     res.json(rows[0])

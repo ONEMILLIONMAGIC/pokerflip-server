@@ -49,6 +49,8 @@ export async function initDB() {
     )
   `)
   await db.query(`CREATE INDEX IF NOT EXISTS idx_pf_tx_tg ON pf_transactions(tg_id, created_at DESC)`)
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS streak_days INTEGER NOT NULL DEFAULT 0`).catch(() => {})
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS last_login_date DATE`).catch(() => {})
 
   // Tournament registrations table
   await db.query(`
