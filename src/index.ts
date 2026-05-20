@@ -88,11 +88,11 @@ app.post('/api/claim', async (req, res) => {
 })
 
 const PACKAGES: Record<string, { chips: number; stars: number; label: string }> = {
-  starter:  { chips:   50_000, stars:   50, label: 'Chips Starter' },
-  standard: { chips:  150_000, stars:  149, label: 'Chips Standard' },
-  popular:  { chips:  500_000, stars:  499, label: 'Chips Popular' },
-  whale:    { chips: 1_000_000, stars: 899, label: 'Chips Whale' },
-  legend:   { chips: 5_000_000, stars: 3999, label: 'Chips Legend' },
+  pack10:  { chips:   10_000, stars:  49, label: '10,000 Chips' },
+  pack30:  { chips:   30_000, stars:  99, label: '30,000 Chips' },
+  pack100: { chips:  100_000, stars: 249, label: '100,000 Chips' },
+  pack250: { chips:  250_000, stars: 499, label: '250,000 Chips' },
+  pack500: { chips:  500_000, stars: 799, label: '500,000 Chips' },
 }
 
 // POST /api/payments/stars-invoice
