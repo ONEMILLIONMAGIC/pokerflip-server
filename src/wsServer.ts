@@ -15,10 +15,11 @@ const clients = new Map<WebSocket, Client>()
 const startTimers = new Map<string, NodeJS.Timeout>()
 const actionTimers = new Map<string, NodeJS.Timeout>()
 
-const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number }> = {
+const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
   main:     { sb: 10,  bb: 20,  minBuyIn: 400 },
   royal:    { sb: 25,  bb: 50,  minBuyIn: 1000 },
   obsidian: { sb: 100, bb: 200, minBuyIn: 5000 },
+  heads:    { sb: 25,  bb: 50,  minBuyIn: 1000, maxPlayers: 2 },
   daily:    { sb: 50,  bb: 100, minBuyIn: 2000 },
   weekly:   { sb: 100, bb: 200, minBuyIn: 5000 },
 }
@@ -202,9 +203,16 @@ async function handleJoin(ws: WebSocket, msg: any) {
   if (!tables.has(tableId)) tables.set(tableId, createTable(tableId, config.sb, config.bb))
   let state = tables.get(tableId)!
 
+  // Check max players
+  const maxPlayers = config.maxPlayers || 6
+  if (state.players.filter(p => p.connected).length >= maxPlayers) {
+    return send(ws, { type: 'error', message: 'Table is full', code: 'table_full' })
+  }
+
   // Find free seat
+  const allSeats = Array.from({ length: maxPlayers }, (_, i) => i)
   const takenSeats = state.players.map(p => p.seatIndex)
-  const seat = [0,1,2,3,4,5].find(s => !takenSeats.includes(s)) ?? 0
+  const seat = allSeats.find(s => !takenSeats.includes(s)) ?? 0
 
   state = addPlayer(state, playerId, playerName, playerChips, seat)
   tables.set(tableId, state)

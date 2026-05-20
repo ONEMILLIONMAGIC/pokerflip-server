@@ -58,6 +58,24 @@ app.post('/api/auth', async (req, res) => {
         res.status(500).json({ error: 'server error' });
     }
 });
+// GET /api/leaderboard
+app.get('/api/leaderboard', async (_req, res) => {
+    try {
+        const db = (0, db_1.getPool)();
+        const { rows } = await db.query(`
+      SELECT tg_id, first_name, username, chips, hands_played, hands_won, biggest_pot,
+        (hands_played * 10 + hands_won * 30 + biggest_pot / 500) AS xp
+      FROM pf_users
+      ORDER BY xp DESC, chips DESC
+      LIMIT 50
+    `);
+        res.json(rows);
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'server error' });
+    }
+});
 // GET /api/referral — return referral stats
 app.get('/api/referral', async (req, res) => {
     try {
