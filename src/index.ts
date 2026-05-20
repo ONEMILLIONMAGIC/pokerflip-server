@@ -376,7 +376,11 @@ app.post('/api/payments/ton-verify', async (req, res) => {
     if (!tonRes.ok) return res.status(502).json({ error: 'blockchain unavailable' })
     const tonData = await tonRes.json() as any
 
-    const tx = (tonData.transactions as any[])?.find((t: any) => {
+    const txList = (tonData.transactions as any[]) || []
+    const twoHoursAgo = Math.floor(Date.now() / 1000) - 7200
+
+    // 1st: exact ref match
+    let tx = txList.find((t: any) => {
       const msg = t.in_msg
       if (!msg) return false
       const comment = msg.decoded_body?.text || ''
@@ -384,10 +388,25 @@ app.post('/api/payments/ton-verify', async (req, res) => {
       return comment === ref && value >= pkg.nanotons * 0.95
     })
 
+    // 2nd fallback: correct amount in last 2h, comment empty or starts with "pf_" (user's transfer)
+    if (!tx) {
+      tx = txList.find((t: any) => {
+        const msg = t.in_msg
+        if (!msg) return false
+        const value = Number(msg.value || 0)
+        const utime = Number(t.utime || 0)
+        const comment = msg.decoded_body?.text || ''
+        const rightAmount = value >= pkg.nanotons * 0.90 && value <= pkg.nanotons * 1.10
+        const recent = utime >= twoHoursAgo
+        const notAlienTx = comment === '' || comment.startsWith('pf_')
+        return rightAmount && recent && notAlienTx
+      })
+    }
+
     if (!tx) return res.json({ found: false })
 
     // Found — credit chips
-    const txId = `tonapi_${tx.hash || ref}`
+    const txId = `tonapi_${tx.hash || tx.utime || ref}`
     await db.query(
       'INSERT INTO pf_ton_payments (boc_hash, tg_id, package_id, chips) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING',
       [txId, String(tgUser.id), packageId, pkg.chips]
