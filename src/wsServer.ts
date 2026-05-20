@@ -299,6 +299,9 @@ async function handleJoin(ws: WebSocket, msg: any) {
     ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips))
     : Math.min(totalChips, maxBuyIn)
 
+  // Declare maxPlayers early (needed for reconnect path too)
+  const maxPlayers = config.maxPlayers || 6
+
   // Cancel any pending AFK removal timer for this player
   const afkKey = `${tableId}:${playerId}`
   const pendingAfk = afkTimers.get(afkKey)
@@ -321,7 +324,6 @@ async function handleJoin(ws: WebSocket, msg: any) {
   }
 
   // Check max players
-  const maxPlayers = config.maxPlayers || 6
   if (state.players.filter(p => p.connected).length >= maxPlayers) {
     return send(ws, { type: 'error', message: 'Table is full', code: 'table_full' })
   }
