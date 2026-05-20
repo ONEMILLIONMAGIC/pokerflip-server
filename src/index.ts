@@ -3,7 +3,7 @@ import { createServer } from 'http'
 import { WebSocketServer } from 'ws'
 import cors from 'cors'
 import dotenv from 'dotenv'
-import { setupWS } from './wsServer'
+import { setupWS, getTableStats } from './wsServer'
 import { initDB, getPool } from './db'
 import { validateTgInitData, parseTgUser } from './utils'
 
@@ -16,7 +16,34 @@ app.use(express.json())
 app.get('/', (_req, res) => res.json({ status: 'PokerFlip server running ♠️' }))
 
 app.get('/tables', (_req, res) => {
-  res.json({ tables: [{ id: 'main', name: 'Main Table', blinds: '10/20', players: 0, maxPlayers: 6 }] })
+  res.json(getTableStats())
+})
+
+// GET /api/tournaments — next occurrence times
+app.get('/api/tournaments', (_req, res) => {
+  const now = new Date()
+
+  function nextDaily() {
+    const d = new Date(now)
+    d.setHours(20, 0, 0, 0)
+    if (d <= now) d.setDate(d.getDate() + 1)
+    return d
+  }
+
+  function nextWeekly() {
+    const d = new Date(now)
+    const day = d.getDay() // 0=Sun
+    const daysUntilSun = day === 0 ? 7 : 7 - day
+    d.setDate(d.getDate() + daysUntilSun)
+    d.setHours(21, 0, 0, 0)
+    if (d <= now) d.setDate(d.getDate() + 7)
+    return d
+  }
+
+  res.json({
+    daily:  { nextAt: nextDaily().toISOString(),  prize: '50,000',  buyIn: '2,000' },
+    weekly: { nextAt: nextWeekly().toISOString(), prize: '500,000', buyIn: '5,000' },
+  })
 })
 
 // POST /api/auth — upsert user, handle referral, return user

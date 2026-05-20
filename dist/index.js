@@ -17,7 +17,32 @@ app.use((0, cors_1.default)());
 app.use(express_1.default.json());
 app.get('/', (_req, res) => res.json({ status: 'PokerFlip server running ♠️' }));
 app.get('/tables', (_req, res) => {
-    res.json({ tables: [{ id: 'main', name: 'Main Table', blinds: '10/20', players: 0, maxPlayers: 6 }] });
+    res.json((0, wsServer_1.getTableStats)());
+});
+// GET /api/tournaments — next occurrence times
+app.get('/api/tournaments', (_req, res) => {
+    const now = new Date();
+    function nextDaily() {
+        const d = new Date(now);
+        d.setHours(20, 0, 0, 0);
+        if (d <= now)
+            d.setDate(d.getDate() + 1);
+        return d;
+    }
+    function nextWeekly() {
+        const d = new Date(now);
+        const day = d.getDay(); // 0=Sun
+        const daysUntilSun = day === 0 ? 7 : 7 - day;
+        d.setDate(d.getDate() + daysUntilSun);
+        d.setHours(21, 0, 0, 0);
+        if (d <= now)
+            d.setDate(d.getDate() + 7);
+        return d;
+    }
+    res.json({
+        daily: { nextAt: nextDaily().toISOString(), prize: '50,000', buyIn: '2,000' },
+        weekly: { nextAt: nextWeekly().toISOString(), prize: '500,000', buyIn: '5,000' },
+    });
 });
 // POST /api/auth — upsert user, handle referral, return user
 app.post('/api/auth', async (req, res) => {
@@ -58,15 +83,17 @@ app.post('/api/auth', async (req, res) => {
         res.status(500).json({ error: 'server error' });
     }
 });
-// GET /api/leaderboard
-app.get('/api/leaderboard', async (_req, res) => {
+// GET /api/leaderboard?period=all|weekly
+app.get('/api/leaderboard', async (req, res) => {
     try {
         const db = (0, db_1.getPool)();
+        const weekly = req.query.period === 'weekly';
         const { rows } = await db.query(`
-      SELECT tg_id, first_name, username, chips, hands_played, hands_won, biggest_pot,
+      SELECT tg_id, first_name, username, photo_url, chips, hands_played, hands_won, biggest_pot,
         (hands_played * 10 + hands_won * 30 + biggest_pot / 500) AS xp
       FROM pf_users
-      ORDER BY xp DESC, chips DESC
+      ${weekly ? "WHERE created_at >= NOW() - INTERVAL '7 days'" : ''}
+      ORDER BY (hands_played * 10 + hands_won * 30 + biggest_pot / 500) DESC, chips DESC
       LIMIT 50
     `);
         res.json(rows);

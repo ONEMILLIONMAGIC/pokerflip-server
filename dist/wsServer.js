@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.setupWS = setupWS;
+exports.getTableStats = getTableStats;
 const ws_1 = require("ws");
 const game_1 = require("./engine/game");
 const db_1 = require("./db");
@@ -9,11 +10,22 @@ const clients = new Map();
 const startTimers = new Map();
 const actionTimers = new Map();
 const TABLE_CONFIG = {
-    // Cash tables — NL Hold'em
+    // NL Hold'em
     main: { sb: 10, bb: 20, minBuyIn: 400 },
     shadow: { sb: 25, bb: 50, minBuyIn: 1000 },
     crimson: { sb: 50, bb: 100, minBuyIn: 2000 },
     obsidian: { sb: 100, bb: 200, minBuyIn: 5000 },
+    // Limit Hold'em
+    limit1: { sb: 10, bb: 20, minBuyIn: 400 },
+    limit2: { sb: 25, bb: 50, minBuyIn: 1000 },
+    limit3: { sb: 50, bb: 100, minBuyIn: 2000 },
+    limit4: { sb: 100, bb: 200, minBuyIn: 5000 },
+    // Pot Limit Omaha
+    plo1: { sb: 25, bb: 50, minBuyIn: 1000 },
+    plo2: { sb: 50, bb: 100, minBuyIn: 2000 },
+    // NL Omaha
+    nlo1: { sb: 25, bb: 50, minBuyIn: 1000 },
+    nlo2: { sb: 50, bb: 100, minBuyIn: 2000 },
     // 1v1 Heads Up
     heads1: { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
     heads2: { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
@@ -178,6 +190,18 @@ function broadcastToTable(tableId, msg) {
 function send(ws, msg) {
     if (ws.readyState === ws_1.WebSocket.OPEN)
         ws.send(JSON.stringify(msg));
+}
+function getTableStats() {
+    const stats = {};
+    for (const [tableId, state] of tables) {
+        const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main;
+        stats[tableId] = {
+            players: state.players.filter(p => p.connected).length,
+            maxPlayers: config.maxPlayers || 6,
+            street: state.street,
+        };
+    }
+    return stats;
 }
 async function handleJoin(ws, msg) {
     const { tableId = 'main', playerId, playerName } = msg;

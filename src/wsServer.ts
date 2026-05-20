@@ -194,6 +194,19 @@ function send(ws: WebSocket, msg: object) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
 }
 
+export function getTableStats(): Record<string, { players: number; maxPlayers: number; street: string }> {
+  const stats: Record<string, { players: number; maxPlayers: number; street: string }> = {}
+  for (const [tableId, state] of tables) {
+    const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main
+    stats[tableId] = {
+      players: state.players.filter(p => p.connected).length,
+      maxPlayers: config.maxPlayers || 6,
+      street: state.street,
+    }
+  }
+  return stats
+}
+
 async function handleJoin(ws: WebSocket, msg: any) {
   const { tableId = 'main', playerId, playerName } = msg
   if (!playerId || !playerName) return send(ws, { type: 'error', message: 'Need playerId and playerName' })
