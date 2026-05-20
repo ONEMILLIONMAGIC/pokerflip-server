@@ -5,6 +5,7 @@ import cors from 'cors'
 import dotenv from 'dotenv'
 import { setupWS, getTableStats } from './wsServer'
 import { initDB, getPool, logTransaction } from './db'
+import { getAchievements } from './achievements'
 import { validateTgInitData, parseTgUser } from './utils'
 
 dotenv.config()
@@ -186,6 +187,23 @@ app.post('/api/auth', async (req, res) => {
     }
 
     res.json(rows[0])
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'server error' })
+  }
+})
+
+// GET /api/achievements
+app.get('/api/achievements', async (req, res) => {
+  try {
+    const initData = req.headers['x-init-data'] as string
+    if (!initData) return res.status(400).json({ error: 'no initData' })
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'invalid' })
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
+    const achievements = await getAchievements(String(tgUser.id))
+    res.json(achievements)
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'server error' })

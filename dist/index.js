@@ -10,6 +10,7 @@ const cors_1 = __importDefault(require("cors"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const wsServer_1 = require("./wsServer");
 const db_1 = require("./db");
+const achievements_1 = require("./achievements");
 const utils_1 = require("./utils");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
@@ -164,6 +165,26 @@ app.post('/api/auth', async (req, res) => {
             return res.json({ ...updated[0], streak_bonus: bonus, streak_days: newStreak });
         }
         res.json(rows[0]);
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'server error' });
+    }
+});
+// GET /api/achievements
+app.get('/api/achievements', async (req, res) => {
+    try {
+        const initData = req.headers['x-init-data'];
+        if (!initData)
+            return res.status(400).json({ error: 'no initData' });
+        const params = (0, utils_1.validateTgInitData)(initData);
+        if (!params)
+            return res.status(403).json({ error: 'invalid' });
+        const tgUser = (0, utils_1.parseTgUser)(params);
+        if (!tgUser?.id)
+            return res.status(400).json({ error: 'no user' });
+        const achievements = await (0, achievements_1.getAchievements)(String(tgUser.id));
+        res.json(achievements);
     }
     catch (e) {
         console.error(e);
