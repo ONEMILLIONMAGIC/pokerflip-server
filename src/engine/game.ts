@@ -15,6 +15,7 @@ export interface Player {
   allIn: boolean
   connected: boolean
   seatIndex: number
+  hasActed: boolean // has voluntarily acted this street
 }
 
 export interface GameState {
@@ -72,6 +73,7 @@ export function startHand(state: GameState): GameState {
     p.totalBet = 0
     p.folded = p.chips === 0
     p.allIn = false
+    p.hasActed = false
   }
 
   // Move dealer button (skip broke/disconnected)
@@ -148,6 +150,7 @@ export function applyAction(state: GameState, playerId: string, action: PlayerAc
     }
   }
 
+  p.hasActed = true
   s.lastActionTime = Date.now()
 
   // Check if street is over
@@ -162,13 +165,13 @@ export function applyAction(state: GameState, playerId: string, action: PlayerAc
 function isStreetOver(s: GameState): boolean {
   const active = s.players.filter(p => !p.folded && !p.allIn)
   if (active.length === 0) return true
-  // All active players have matched the current bet
-  return active.every(p => p.bet === s.currentBet || p.allIn)
+  // All active players have matched the current bet AND had a chance to act
+  return active.every(p => p.hasActed && p.bet === s.currentBet)
 }
 
 function advanceStreet(s: GameState): GameState {
-  // Reset bets for new street
-  for (const p of s.players) p.bet = 0
+  // Reset bets and acted flags for new street
+  for (const p of s.players) { p.bet = 0; p.hasActed = false }
   s.currentBet = 0
   s.minRaise = s.bigBlind
 
@@ -242,7 +245,7 @@ export function addPlayer(state: GameState, id: string, name: string, chips: num
   const s = deepClone(state)
   const existing = s.players.find(p => p.id === id)
   if (existing) { existing.connected = true; return s }
-  s.players.push({ id, name, chips, holeCards: [], bet: 0, totalBet: 0, folded: false, allIn: false, connected: true, seatIndex: seat })
+  s.players.push({ id, name, chips, holeCards: [], bet: 0, totalBet: 0, folded: false, allIn: false, connected: true, seatIndex: seat, hasActed: false })
   s.players.sort((a, b) => a.seatIndex - b.seatIndex)
   return s
 }
