@@ -43,9 +43,13 @@ app.post('/api/webhook', async (req, res) => {
     const firstName = msg.from?.first_name || 'Player'
 
     if (text.startsWith('/start')) {
+      // Parse referral param: "/start 8003578355" → refId = "8003578355"
+      const refId = text.slice(6).trim()
+      const btnUrl = refId ? `${TMA_URL}?startapp=${refId}` : TMA_URL
+      const startBtn = { inline_keyboard: [[{ text: '♠️ Play Now', web_app: { url: btnUrl } }]] }
       await tgSend(chatId,
         `♠️ Welcome to *PokerFlip*, ${firstName}!\n\nPlay Texas Hold'em poker with free chips.\n\n🎁 *3,000 chips* to start\n⏰ Claim *+500 chips* every 6 hours\n🎰 Daily spin wheel — up to *50,000 chips*!\n👥 Invite friends → *+3,000 chips* each\n\nJoin tables, climb the leaderboard, win tournaments!`,
-        { reply_markup: PLAY_BTN })
+        { reply_markup: startBtn })
     }
 
     else if (text === '/stats' || text === '/balance') {
