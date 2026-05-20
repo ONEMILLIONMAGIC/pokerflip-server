@@ -156,6 +156,11 @@ app.get('/tables', (_req, res) => {
 
 const MIN_PLAYERS = 6
 
+const TOURNAMENT_CONFIGS: Record<string, { basePrize: number; buyIn: number; nextAt: () => Date }> = {
+  daily:  { basePrize: 50_000,  buyIn: 2_000, nextAt: () => nextOccurrence(20) },
+  weekly: { basePrize: 300_000, buyIn: 5_000, nextAt: () => nextOccurrence(21, 0, 0) },
+}
+
 function nextOccurrence(hour: number, minute = 0, weekday?: number) {
   const now = new Date()
   const d = new Date(now)
@@ -168,7 +173,17 @@ function nextOccurrence(hour: number, minute = 0, weekday?: number) {
   return d
 }
 
-async function getTournamentState() {
+function calcPrizeDistribution(prizePool: number, registered: number) {
+  const tiers =
+    registered <= 1  ? [{ place: 1, pct: 100 }]
+    : registered <= 4  ? [{ place: 1, pct: 60 }, { place: 2, pct: 40 }]
+    : registered <= 8  ? [{ place: 1, pct: 50 }, { place: 2, pct: 30 }, { place: 3, pct: 20 }]
+    : registered <= 16 ? [{ place: 1, pct: 40 }, { place: 2, pct: 25 }, { place: 3, pct: 15 }, { place: 4, pct: 12 }, { place: 5, pct: 8 }]
+    :                    [{ place: 1, pct: 35 }, { place: 2, pct: 22 }, { place: 3, pct: 14 }, { place: 4, pct: 10 }, { place: 5, pct: 8 }, { place: 6, pct: 6 }, { place: 7, pct: 5 }]
+  return tiers.map(t => ({ place: t.place, pct: t.pct, amount: Math.floor(prizePool * t.pct / 100) }))
+}
+
+async function getTournamentState(tgId?: string) {
   const db = getPool()
   const { rows } = await db.query(
     `SELECT tournament_id, COUNT(*) as cnt FROM pf_tournament_regs GROUP BY tournament_id`
@@ -176,19 +191,49 @@ async function getTournamentState() {
   const counts: Record<string, number> = {}
   rows.forEach((r: any) => { counts[r.tournament_id] = Number(r.cnt) })
 
-  return {
-    daily:  { nextAt: nextOccurrence(20).toISOString(),       prize: '50,000',  buyIn: '2,000', registered: counts['daily'] || 0,  minPlayers: MIN_PLAYERS, canStart: (counts['daily'] || 0) >= MIN_PLAYERS },
-    weekly: { nextAt: nextOccurrence(21, 0, 0).toISOString(), prize: '300,000', buyIn: '5,000', registered: counts['weekly'] || 0, minPlayers: MIN_PLAYERS, canStart: (counts['weekly'] || 0) >= MIN_PLAYERS },
+  let userRegs: Record<string, boolean> = {}
+  if (tgId) {
+    const { rows: rr } = await db.query(
+      `SELECT tournament_id FROM pf_tournament_regs WHERE tg_id=$1`, [tgId]
+    ).catch(() => ({ rows: [] as any[] }))
+    rr.forEach((r: any) => { userRegs[r.tournament_id] = true })
   }
+
+  const result: Record<string, any> = {}
+  for (const [id, cfg] of Object.entries(TOURNAMENT_CONFIGS)) {
+    const registered = counts[id] || 0
+    const prizePool = Math.max(cfg.basePrize, registered * cfg.buyIn)
+    result[id] = {
+      nextAt: cfg.nextAt().toISOString(),
+      buyIn: cfg.buyIn.toLocaleString(),
+      buyInRaw: cfg.buyIn,
+      prize: prizePool.toLocaleString(),
+      prizeRaw: prizePool,
+      registered,
+      minPlayers: MIN_PLAYERS,
+      canStart: registered >= MIN_PLAYERS,
+      isRegistered: userRegs[id] || false,
+      prizes: calcPrizeDistribution(prizePool, registered),
+    }
+  }
+  return result
 }
 
-// GET /api/tournaments
-app.get('/api/tournaments', async (_req, res) => {
-  try { res.json(await getTournamentState()) }
-  catch (e) { res.status(500).json({ error: 'server error' }) }
+// GET /api/tournaments — pass x-init-data to get isRegistered flag
+app.get('/api/tournaments', async (req, res) => {
+  try {
+    let tgId: string | undefined
+    const initDataHeader = req.headers['x-init-data'] as string | undefined
+    if (initDataHeader) {
+      const p = validateTgInitData(initDataHeader)
+      const u = p ? parseTgUser(p) : null
+      if (u?.id) tgId = String(u.id)
+    }
+    res.json(await getTournamentState(tgId))
+  } catch (e) { res.status(500).json({ error: 'server error' }) }
 })
 
-// POST /api/tournaments/register
+// POST /api/tournaments/register — deduct buy-in, insert, return updated state
 app.post('/api/tournaments/register', async (req, res) => {
   try {
     const { initData, tournamentId } = req.body as { initData?: string; tournamentId?: string }
@@ -198,25 +243,27 @@ app.post('/api/tournaments/register', async (req, res) => {
     const tgUser = parseTgUser(params)
     if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
 
-    const buyIns: Record<string, number> = { daily: 2000, weekly: 5000 }
-    const cost = buyIns[tournamentId]
-    if (!cost) return res.status(400).json({ error: 'unknown tournament' })
-
+    const cfg = TOURNAMENT_CONFIGS[tournamentId]
+    if (!cfg) return res.status(400).json({ error: 'unknown tournament' })
+    const tgId = String(tgUser.id)
     const db = getPool()
-    const { rows: userRows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [String(tgUser.id)])
-    if (!userRows[0] || userRows[0].chips < cost) return res.status(400).json({ error: 'insufficient_chips', required: cost })
 
-    // Idempotent insert
-    const { rowCount } = await db.query(
-      `INSERT INTO pf_tournament_regs (tg_id, tournament_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-      [String(tgUser.id), tournamentId]
-    )
-    if (rowCount && rowCount > 0) {
-      await db.query('UPDATE pf_users SET chips = chips - $1 WHERE tg_id=$2', [cost, String(tgUser.id)])
-      await logTransaction(String(tgUser.id), 'tournament', -cost, `Registered: ${tournamentId} tournament`)
+    const { rows: userRows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [tgId])
+    if (!userRows[0]) return res.status(404).json({ error: 'user not found' })
+    if (userRows[0].chips < cfg.buyIn) {
+      return res.status(400).json({ error: 'insufficient_chips', required: cfg.buyIn, have: userRows[0].chips })
     }
 
-    res.json({ ok: true, ...(await getTournamentState()) })
+    const { rowCount } = await db.query(
+      `INSERT INTO pf_tournament_regs (tg_id, tournament_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [tgId, tournamentId]
+    )
+    if (rowCount && rowCount > 0) {
+      await db.query('UPDATE pf_users SET chips = chips - $1 WHERE tg_id=$2', [cfg.buyIn, tgId])
+      await logTransaction(tgId, 'tournament', -cfg.buyIn, `Registered: ${tournamentId} (${cfg.buyIn.toLocaleString()} chips)`)
+    }
+    // rowCount=0 means already registered — not an error, just idempotent
+    res.json({ ok: true, ...(await getTournamentState(tgId)) })
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'server error' })
