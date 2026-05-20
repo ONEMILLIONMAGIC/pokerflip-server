@@ -14,7 +14,8 @@ const clients = new Map<WebSocket, Client>()
 
 const startTimers = new Map<string, NodeJS.Timeout>()
 const actionTimers = new Map<string, NodeJS.Timeout>()
-const afkTimers = new Map<string, NodeJS.Timeout>() // key: tableId:playerId
+const afkTimers = new Map<string, NodeJS.Timeout>()   // key: tableId:playerId
+const playerBanks = new Map<string, number>()          // key: tableId:playerId → chips left in bank (DB - buyIn)
 
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
   // NL Hold'em
@@ -127,11 +128,17 @@ function handleDisconnect(ws: WebSocket) {
   let state = tables.get(tableId)
   if (!state) return
 
-  // Save chips immediately
+  // Save chips: bankChips (what's in DB) + table chips
   const player = state.players.find(p => p.id === playerId)
   if (player && process.env.DATABASE_URL) {
-    getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [player.chips, playerId])
+    const bankKey = `${tableId}:${playerId}`
+    const bank = playerBanks.get(bankKey) ?? 0
+    const totalToSave = bank + player.chips
+    getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [totalToSave, playerId])
       .catch(e => console.error('Failed to save chips on disconnect:', e))
+    if (player.chips !== 0) {
+      logTransaction(playerId, 'table_leave', player.chips, `Cash out from ${tableId} (${player.chips.toLocaleString()} chips)`)
+    }
   }
 
   // Mark as AFK/disconnected (not removed yet — give 30s to reconnect)
@@ -172,11 +179,11 @@ function handleDisconnect(ws: WebSocket) {
 
   const afkTimer = setTimeout(() => {
     afkTimers.delete(afkKey)
+    playerBanks.delete(`${tableId}:${playerId}`)
     let s = tables.get(tableId)
     if (!s) return
     const p = s.players.find(pp => pp.id === playerId)
     if (p && !p.connected) {
-      // Still not reconnected — remove slot so others can join
       s.players = s.players.filter(pp => pp.id !== playerId)
       tables.set(tableId, s)
       broadcastTable(tableId)
@@ -337,6 +344,17 @@ async function handleJoin(ws: WebSocket, msg: any) {
   tables.set(tableId, state)
   clients.set(ws, { ws, playerId, playerName, tableId })
 
+  // Store bank chips (what remains in DB = totalChips - buyIn)
+  const bankChips = totalChips - playerChips
+  playerBanks.set(`${tableId}:${playerId}`, bankChips)
+
+  // Deduct buy-in from DB now; will add back table chips on leave
+  if (process.env.DATABASE_URL) {
+    getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [bankChips, playerId])
+      .catch(e => console.error('Failed to deduct buy-in:', e))
+    logTransaction(playerId, 'table_join', -playerChips, `Buy-in at ${tableId} (${playerChips.toLocaleString()} chips)`)
+  }
+
   broadcastTable(tableId)
   send(ws, { type: 'joined', playerId, tableId, chips: playerChips, maxPlayers })
   scheduleStart(tableId)
@@ -352,6 +370,11 @@ async function saveHandStats(state: GameState) {
     const isWinner = winnerIds.has(player.id)
     const wonAmount = state.winners.find(w => w.playerId === player.id)?.amount || 0
 
+    // Total chips = bank (outside table) + current table chips
+    const bankKey = `${state.tableId}:${player.id}`
+    const bank = playerBanks.get(bankKey) ?? 0
+    const totalChips = bank + player.chips
+
     await db.query(
       `UPDATE pf_users SET
         chips        = $1,
@@ -359,7 +382,7 @@ async function saveHandStats(state: GameState) {
         hands_won    = hands_won + $2,
         biggest_pot  = GREATEST(biggest_pot, $3)
        WHERE tg_id = $4`,
-      [player.chips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]
+      [totalChips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]
     ).catch(() => {})
 
     if (isWinner && wonAmount > 0) {
