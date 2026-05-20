@@ -161,11 +161,24 @@ function setActionTimer(tableId: string) {
     let state = tables.get(tableId)
     if (!state || state.street === 'waiting' || state.street === 'showdown') return
     const p = state.players[state.actionIdx]
-    if (!p || p.folded || p.allIn) return
-    // Auto-fold on timeout
+    if (!p || p.folded || p.allIn) { setActionTimer(tableId); return }
+    const prevStreet = state.street
     state = applyAction(state, p.id, 'fold')
     tables.set(tableId, state)
     broadcastTable(tableId)
+    if (state.street === 'showdown' && prevStreet !== 'showdown') {
+      saveHandStats(state).catch(console.error)
+      setTimeout(() => {
+        let s = tables.get(tableId)
+        if (!s) return
+        s = canStart(s) ? startHand(s) : { ...s, street: 'waiting' as any }
+        tables.set(tableId, s)
+        broadcastTable(tableId)
+        setActionTimer(tableId)
+      }, 4000)
+    } else {
+      setActionTimer(tableId)
+    }
   }, ACTION_TIMEOUT_MS)
   actionTimers.set(tableId, timer)
 }
