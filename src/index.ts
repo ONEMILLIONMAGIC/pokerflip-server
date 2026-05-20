@@ -368,26 +368,26 @@ app.post('/api/payments/ton-verify', async (req, res) => {
     const { rows: used } = await db.query('SELECT 1 FROM pf_ton_payments WHERE boc_hash=$1', [ref])
     if (used.length > 0) return res.status(409).json({ error: 'already_used' })
 
-    // Query TON Center API for recent incoming transactions
+    // Query tonapi.io for recent incoming transactions
     const tonRes = await fetch(
-      `https://toncenter.com/api/v2/getTransactions?address=${WALLET}&limit=20&archival=false`,
-      { headers: { 'Content-Type': 'application/json' } }
+      `https://tonapi.io/v2/blockchain/accounts/${WALLET}/transactions?limit=30`,
+      { signal: AbortSignal.timeout(8000) }
     )
+    if (!tonRes.ok) return res.status(502).json({ error: 'blockchain unavailable' })
     const tonData = await tonRes.json() as any
-    if (!tonData.ok) return res.status(502).json({ error: 'blockchain unavailable' })
 
-    const tx = (tonData.result as any[]).find((t: any) => {
+    const tx = (tonData.transactions as any[])?.find((t: any) => {
       const msg = t.in_msg
       if (!msg) return false
-      const comment = msg.message || ''
+      const comment = msg.decoded_body?.text || ''
       const value = Number(msg.value || 0)
-      return comment === ref && value >= pkg.nanotons * 0.95 // 5% tolerance
+      return comment === ref && value >= pkg.nanotons * 0.95
     })
 
     if (!tx) return res.json({ found: false })
 
     // Found — credit chips
-    const txId = `toncenter_${tx.transaction_id?.hash || ref}`
+    const txId = `tonapi_${tx.hash || ref}`
     await db.query(
       'INSERT INTO pf_ton_payments (boc_hash, tg_id, package_id, chips) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING',
       [txId, String(tgUser.id), packageId, pkg.chips]
