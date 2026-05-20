@@ -246,6 +246,46 @@ app.post('/api/spin', async (req, res) => {
   }
 })
 
+// POST /api/payments/ton-confirm — verify TON payment and credit chips
+app.post('/api/payments/ton-confirm', async (req, res) => {
+  try {
+    const { initData, packageId, bocHash } = req.body as { initData?: string; packageId?: string; bocHash?: string }
+    if (!initData || !packageId || !bocHash) return res.status(400).json({ error: 'missing params' })
+
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'invalid initData' })
+
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
+
+    const TON_PACKAGES: Record<string, { chips: number; ton: number }> = {
+      pack10:  { chips:   10_000, ton: 0.5 },
+      pack30:  { chips:   30_000, ton: 1.0 },
+      pack100: { chips:  100_000, ton: 3.0 },
+      pack250: { chips:  250_000, ton: 6.0 },
+      pack500: { chips:  500_000, ton: 10.0 },
+    }
+    const pkg = TON_PACKAGES[packageId]
+    if (!pkg) return res.status(400).json({ error: 'unknown package' })
+
+    const db = getPool()
+
+    // Prevent double-spending
+    const { rows: existing } = await db.query('SELECT 1 FROM pf_ton_payments WHERE boc_hash=$1', [bocHash])
+    if (existing.length > 0) return res.status(409).json({ error: 'already_used' })
+
+    // Credit chips and record payment
+    await db.query('INSERT INTO pf_ton_payments (boc_hash, tg_id, package_id, chips) VALUES ($1,$2,$3,$4)', [bocHash, String(tgUser.id), packageId, pkg.chips])
+    const { rows } = await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING *', [pkg.chips, String(tgUser.id)])
+    await logTransaction(String(tgUser.id), 'purchase', pkg.chips, `Bought ${pkg.chips.toLocaleString()} chips (TON)`)
+
+    res.json(rows[0])
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'server error' })
+  }
+})
+
 // GET /api/achievements
 app.get('/api/achievements', async (req, res) => {
   try {

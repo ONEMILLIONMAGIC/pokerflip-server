@@ -53,6 +53,15 @@ export async function initDB() {
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS last_login_date DATE`).catch(() => {})
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS last_spin_at TIMESTAMPTZ`).catch(() => {})
   await db.query(`
+    CREATE TABLE IF NOT EXISTS pf_ton_payments (
+      boc_hash   TEXT PRIMARY KEY,
+      tg_id      TEXT NOT NULL,
+      package_id TEXT NOT NULL,
+      chips      INTEGER NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
+  await db.query(`
     CREATE TABLE IF NOT EXISTS pf_achievements (
       tg_id          TEXT NOT NULL,
       achievement_id TEXT NOT NULL,
