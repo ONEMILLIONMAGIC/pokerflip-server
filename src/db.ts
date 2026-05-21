@@ -84,4 +84,15 @@ export async function initDB() {
       PRIMARY KEY (tg_id, tournament_id)
     )
   `)
+
+  // Tournament lifecycle status
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS pf_tournament_status (
+      tournament_id TEXT PRIMARY KEY,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      cycle_key     TEXT NOT NULL DEFAULT '',
+      started_at    TIMESTAMPTZ
+    )
+  `)
+  await db.query(`INSERT INTO pf_tournament_status (tournament_id) VALUES ('daily'),('weekly') ON CONFLICT DO NOTHING`)
 }

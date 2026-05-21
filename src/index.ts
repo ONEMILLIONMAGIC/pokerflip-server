@@ -156,9 +156,78 @@ app.get('/tables', (_req, res) => {
 
 const MIN_PLAYERS = 6
 
-const TOURNAMENT_CONFIGS: Record<string, { basePrize: number; buyIn: number; nextAt: () => Date }> = {
-  daily:  { basePrize: 50_000,  buyIn: 2_000, nextAt: () => nextOccurrence(20) },
-  weekly: { basePrize: 300_000, buyIn: 5_000, nextAt: () => nextOccurrence(21, 0, 0) },
+const TOURNAMENT_CONFIGS: Record<string, { basePrize: number; buyIn: number; nextAt: () => Date; hour: number; weekday?: number }> = {
+  daily:  { basePrize: 50_000,  buyIn: 2_000, nextAt: () => nextOccurrence(20), hour: 20 },
+  weekly: { basePrize: 300_000, buyIn: 5_000, nextAt: () => nextOccurrence(21, 0, 0), hour: 21, weekday: 0 },
+}
+
+// Cycle key = "daily-2026-05-21" or "weekly-2026-W21"
+function cycleKey(id: string): string {
+  const now = new Date()
+  if (id === 'weekly') {
+    const week = Math.ceil((now.getDate() - now.getDay() + 1) / 7)
+    return `${id}-${now.getFullYear()}-W${String(now.getMonth() + 1).padStart(2,'0')}${week}`
+  }
+  return `${id}-${now.toISOString().slice(0,10)}`
+}
+
+// Check if it's time to start this tournament (within 5-min window after scheduled hour)
+function isTournamentWindow(id: string): boolean {
+  const cfg = TOURNAMENT_CONFIGS[id]
+  if (!cfg) return false
+  const now = new Date()
+  const h = now.getHours(), m = now.getMinutes()
+  const dayMatch = cfg.weekday !== undefined ? now.getDay() === cfg.weekday : true
+  return dayMatch && h === cfg.hour && m < 5
+}
+
+// Auto-start: runs every 60s, fires bot notifications + marks active
+async function checkTournamentAutoStart() {
+  const db = getPool()
+  for (const id of Object.keys(TOURNAMENT_CONFIGS)) {
+    if (!isTournamentWindow(id)) continue
+    const key = cycleKey(id)
+    // Already started this cycle?
+    const { rows: st } = await db.query(
+      `SELECT status, cycle_key FROM pf_tournament_status WHERE tournament_id=$1`, [id]
+    ).catch(() => ({ rows: [] as any[] }))
+    if (st[0]?.cycle_key === key && st[0]?.status !== 'pending') continue
+
+    // Check registered count
+    const { rows: cr } = await db.query(
+      `SELECT COUNT(*) as cnt FROM pf_tournament_regs WHERE tournament_id=$1`, [id]
+    ).catch(() => ({ rows: [{ cnt: 0 }] }))
+    const registered = Number(cr[0]?.cnt || 0)
+    if (registered < MIN_PLAYERS) continue
+
+    // Mark active
+    await db.query(
+      `UPDATE pf_tournament_status SET status='active', cycle_key=$1, started_at=NOW() WHERE tournament_id=$2`,
+      [key, id]
+    ).catch(() => {})
+
+    // Notify registered players via bot
+    const cfg = TOURNAMENT_CONFIGS[id]
+    const { rows: players } = await db.query(
+      `SELECT u.tg_id FROM pf_tournament_regs r JOIN pf_users u ON u.tg_id=r.tg_id WHERE r.tournament_id=$1`, [id]
+    ).catch(() => ({ rows: [] as any[] }))
+    const tableUrl = `https://t.me/${process.env.BOT_USERNAME || 'pokerflip_bot'}?startapp=${id}`
+    for (const p of players) {
+      tgSend(p.tg_id, `🏆 *Tournament Starting Now!*\n\nThe *${id === 'daily' ? 'Daily Grind' : 'Weekly Chill'}* tournament has started!\n\nJoin your table now — seats are limited.`, {
+        reply_markup: { inline_keyboard: [[{ text: '♠️ Join Tournament', url: tableUrl }]] }
+      }).catch(() => {})
+    }
+    console.log(`Tournament ${id} started for cycle ${key} with ${registered} players`)
+  }
+}
+
+// Reset finished tournaments after 3 hours
+async function checkTournamentReset() {
+  const db = getPool()
+  await db.query(`
+    UPDATE pf_tournament_status SET status='pending', cycle_key='', started_at=NULL
+    WHERE status='active' AND started_at < NOW() - INTERVAL '3 hours'
+  `).catch(() => {})
 }
 
 function nextOccurrence(hour: number, minute = 0, weekday?: number) {
@@ -185,11 +254,14 @@ function calcPrizeDistribution(prizePool: number, registered: number) {
 
 async function getTournamentState(tgId?: string) {
   const db = getPool()
-  const { rows } = await db.query(
-    `SELECT tournament_id, COUNT(*) as cnt FROM pf_tournament_regs GROUP BY tournament_id`
-  ).catch(() => ({ rows: [] as any[] }))
+  const [regRows, statusRows] = await Promise.all([
+    db.query(`SELECT tournament_id, COUNT(*) as cnt FROM pf_tournament_regs GROUP BY tournament_id`).catch(() => ({ rows: [] as any[] })),
+    db.query(`SELECT tournament_id, status FROM pf_tournament_status`).catch(() => ({ rows: [] as any[] })),
+  ])
   const counts: Record<string, number> = {}
-  rows.forEach((r: any) => { counts[r.tournament_id] = Number(r.cnt) })
+  regRows.rows.forEach((r: any) => { counts[r.tournament_id] = Number(r.cnt) })
+  const statuses: Record<string, string> = {}
+  statusRows.rows.forEach((r: any) => { statuses[r.tournament_id] = r.status })
 
   let userRegs: Record<string, boolean> = {}
   if (tgId) {
@@ -203,6 +275,7 @@ async function getTournamentState(tgId?: string) {
   for (const [id, cfg] of Object.entries(TOURNAMENT_CONFIGS)) {
     const registered = counts[id] || 0
     const prizePool = Math.max(cfg.basePrize, registered * cfg.buyIn)
+    const status = statuses[id] || 'pending'
     result[id] = {
       nextAt: cfg.nextAt().toISOString(),
       buyIn: cfg.buyIn.toLocaleString(),
@@ -212,6 +285,7 @@ async function getTournamentState(tgId?: string) {
       registered,
       minPlayers: MIN_PLAYERS,
       canStart: registered >= MIN_PLAYERS,
+      status,
       isRegistered: userRegs[id] || false,
       prizes: calcPrizeDistribution(prizePool, registered),
     }
@@ -862,3 +936,5 @@ setupWS(wss)
 const PORT = process.env.PORT || 3002
 server.listen(PORT, () => console.log(`\n♠️ PokerFlip server → http://localhost:${PORT}\n   WebSocket → ws://localhost:${PORT}\n`))
 initDB().catch(e => console.error('DB init warning:', e))
+setInterval(checkTournamentAutoStart, 60_000)
+setInterval(checkTournamentReset, 5 * 60_000)
