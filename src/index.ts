@@ -270,6 +270,26 @@ app.post('/api/tournaments/register', async (req, res) => {
   }
 })
 
+// GET /api/tournaments/:id/players — list of registered players
+app.get('/api/tournaments/:id/players', async (req, res) => {
+  try {
+    const db = getPool()
+    const { id } = req.params
+    const { rows } = await db.query(
+      `SELECT u.tg_id, u.first_name, u.username, u.photo_url
+       FROM pf_tournament_regs r
+       JOIN pf_users u ON u.tg_id = r.tg_id
+       WHERE r.tournament_id = $1
+       ORDER BY r.registered_at ASC`,
+      [id]
+    )
+    res.json(rows)
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'server error' })
+  }
+})
+
 // POST /api/auth — upsert user, handle referral, return user
 app.post('/api/auth', async (req, res) => {
   try {
