@@ -502,6 +502,13 @@ async function checkTournamentEnd(state: GameState) {
   ).catch(() => {})
   await logTransaction(winner.id, 'tournament_win', winnerPrize, `Won ${tableId} tournament! 🏆 +${winnerPrize.toLocaleString()} chips`)
 
+  // Save to history
+  await db.query(
+    `INSERT INTO pf_tournament_history (tournament_id, winner_tg_id, winner_name, prize, players_count, prize_pool)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [tableId, winner.id, winner.name, winnerPrize, registered, prizePool]
+  ).catch(() => {})
+
   // Mark tournament as finished, reset registrations for next cycle
   await db.query(
     `UPDATE pf_tournament_status SET status='finished' WHERE tournament_id=$1`, [tableId]

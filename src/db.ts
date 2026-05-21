@@ -95,4 +95,17 @@ export async function initDB() {
     )
   `)
   await db.query(`INSERT INTO pf_tournament_status (tournament_id) VALUES ('daily'),('weekly') ON CONFLICT DO NOTHING`)
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS pf_tournament_history (
+      id            SERIAL PRIMARY KEY,
+      tournament_id TEXT NOT NULL,
+      winner_tg_id  TEXT NOT NULL,
+      winner_name   TEXT NOT NULL,
+      prize         INTEGER NOT NULL,
+      players_count INTEGER NOT NULL DEFAULT 0,
+      prize_pool    INTEGER NOT NULL DEFAULT 0,
+      finished_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
 }

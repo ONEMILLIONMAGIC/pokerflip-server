@@ -104,6 +104,47 @@ app.post('/api/webhook', async (req, res) => {
         `/help — this message`)
     }
 
+    // Admin commands (only for admin tgId)
+    else if (String(chatId) === (process.env.ADMIN_TG_ID || '501197162')) {
+      const db = getPool()
+      if (text?.startsWith('/admin start ')) {
+        const id = text.split(' ')[2]?.trim()
+        if (!['daily', 'weekly'].includes(id)) {
+          await tgSend(chatId, '❌ Unknown tournament. Use: daily or weekly')
+        } else {
+          const { rows: regRows } = await db.query(`SELECT COUNT(*) as cnt FROM pf_tournament_regs WHERE tournament_id=$1`, [id])
+          const registered = Number(regRows[0]?.cnt || 0)
+          await db.query(`UPDATE pf_tournament_status SET status='active', cycle_key=$1, started_at=NOW() WHERE tournament_id=$2`,
+            [`admin-${Date.now()}`, id])
+          // Notify registered players
+          const { rows: players } = await db.query(
+            `SELECT u.tg_id FROM pf_tournament_regs r JOIN pf_users u ON u.tg_id=r.tg_id WHERE r.tournament_id=$1`, [id])
+          for (const p of players) {
+            tgSend(p.tg_id, `🏆 *Tournament Starting Now!*\nThe *${id === 'daily' ? 'Daily Grind' : 'Weekly Chill'}* has started! Join now!`, { reply_markup: PLAY_BTN }).catch(() => {})
+          }
+          await tgSend(chatId, `✅ Tournament *${id}* started. ${registered} players notified.`)
+        }
+      } else if (text?.startsWith('/admin end ')) {
+        const id = text.split(' ')[2]?.trim()
+        await db.query(`UPDATE pf_tournament_status SET status='pending', cycle_key='', started_at=NULL WHERE tournament_id=$1`, [id])
+        await tgSend(chatId, `✅ Tournament *${id}* reset to pending.`)
+      } else if (text === '/admin stats') {
+        const { rows } = await db.query(`SELECT tournament_id, status, started_at FROM pf_tournament_status`)
+        const { rows: reg } = await db.query(`SELECT tournament_id, COUNT(*) as cnt FROM pf_tournament_regs GROUP BY tournament_id`)
+        const regMap: Record<string, number> = {}
+        reg.forEach((r: any) => { regMap[r.tournament_id] = Number(r.cnt) })
+        const lines = rows.map((r: any) => `*${r.tournament_id}*: ${r.status} | ${regMap[r.tournament_id] || 0} registered`)
+        await tgSend(chatId, `📊 *Tournament Status*\n\n${lines.join('\n')}`)
+      } else if (text === '/admin') {
+        await tgSend(chatId,
+          `🔧 *Admin Commands*\n\n` +
+          `/admin start daily — force start Daily tournament\n` +
+          `/admin start weekly — force start Weekly tournament\n` +
+          `/admin end daily — reset tournament to pending\n` +
+          `/admin stats — tournament & registration status`)
+      }
+    }
+
   } catch (e) {
     console.error('Webhook error:', e)
   }
@@ -360,6 +401,20 @@ app.get('/api/tournaments/:id/players', async (req, res) => {
     res.json(rows)
   } catch (e) {
     console.error(e)
+    res.status(500).json({ error: 'server error' })
+  }
+})
+
+// GET /api/tournaments/history — past tournament results
+app.get('/api/tournaments/history', async (req, res) => {
+  try {
+    const db = getPool()
+    const { rows } = await db.query(
+      `SELECT tournament_id, winner_name, prize, players_count, prize_pool, finished_at
+       FROM pf_tournament_history ORDER BY finished_at DESC LIMIT 20`
+    )
+    res.json(rows)
+  } catch (e) {
     res.status(500).json({ error: 'server error' })
   }
 })
