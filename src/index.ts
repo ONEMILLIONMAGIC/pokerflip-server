@@ -643,7 +643,7 @@ app.get('/api/transactions', async (req, res) => {
     if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
     const db = getPool()
     const { rows } = await db.query(
-      `SELECT type, amount, desc, created_at FROM pf_transactions WHERE tg_id=$1 ORDER BY created_at DESC LIMIT 30`,
+      `SELECT type, amount, description AS desc, created_at FROM pf_transactions WHERE tg_id=$1 ORDER BY created_at DESC LIMIT 50`,
       [String(tgUser.id)]
     )
     res.json(rows)

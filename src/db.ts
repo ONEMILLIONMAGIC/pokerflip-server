@@ -9,12 +9,12 @@ export function getPool() {
   return pool
 }
 
-export async function logTransaction(tgId: string, type: string, amount: number, desc: string) {
+export async function logTransaction(tgId: string, type: string, amount: number, description: string) {
   const db = getPool()
   await db.query(
-    'INSERT INTO pf_transactions (tg_id, type, amount, desc) VALUES ($1,$2,$3,$4)',
-    [tgId, type, amount, desc]
-  ).catch(() => {})
+    'INSERT INTO pf_transactions (tg_id, type, amount, description) VALUES ($1,$2,$3,$4)',
+    [tgId, type, amount, description]
+  ).catch(e => console.error('logTransaction error:', e.message))
 }
 
 export async function initDB() {
@@ -40,15 +40,16 @@ export async function initDB() {
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS tournaments_won INTEGER NOT NULL DEFAULT 0`).catch(() => {})
   await db.query(`
     CREATE TABLE IF NOT EXISTS pf_transactions (
-      id         SERIAL PRIMARY KEY,
-      tg_id      TEXT NOT NULL,
-      type       TEXT NOT NULL,
-      amount     INTEGER NOT NULL,
-      desc       TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      id          SERIAL PRIMARY KEY,
+      tg_id       TEXT NOT NULL,
+      type        TEXT NOT NULL,
+      amount      INTEGER NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `)
   await db.query(`CREATE INDEX IF NOT EXISTS idx_pf_tx_tg ON pf_transactions(tg_id, created_at DESC)`)
+  await db.query(`ALTER TABLE pf_transactions ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''`).catch(() => {})
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS streak_days INTEGER NOT NULL DEFAULT 0`).catch(() => {})
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS last_login_date DATE`).catch(() => {})
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS last_spin_at TIMESTAMPTZ`).catch(() => {})
