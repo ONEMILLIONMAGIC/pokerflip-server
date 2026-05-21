@@ -642,8 +642,12 @@ app.get('/api/transactions', async (req, res) => {
     const tgUser = parseTgUser(params)
     if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
     const db = getPool()
+    // Exclude per-hand 'win' events — too noisy. Show only meaningful activity:
+    // table_join, table_leave, claim, purchase, tournament, spin, admin
     const { rows } = await db.query(
-      `SELECT type, amount, description AS desc, created_at FROM pf_transactions WHERE tg_id=$1 ORDER BY created_at DESC LIMIT 50`,
+      `SELECT type, amount, description AS desc, created_at FROM pf_transactions
+       WHERE tg_id=$1 AND type != 'win'
+       ORDER BY created_at DESC LIMIT 50`,
       [String(tgUser.id)]
     )
     res.json(rows)
