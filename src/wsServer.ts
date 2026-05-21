@@ -405,7 +405,7 @@ async function saveHandStats(state: GameState) {
         hands_won    = hands_won + $2,
         biggest_pot  = GREATEST(biggest_pot, $3)
        WHERE tg_id = $4
-       RETURNING hands_played, referred_by, referral_credited`,
+       RETURNING hands_played, referred_by, referral_credited, referral_bonus`,
       [totalChips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]
     ).catch(() => ({ rows: [] as any[] }))
 
@@ -413,19 +413,20 @@ async function saveHandStats(state: GameState) {
       await logTransaction(player.id, 'win', wonAmount, `Won hand at table ${state.tableId}`)
     }
 
-    // Anti-bot referral (non-premium): +1000 to referrer after 10 hands
+    // Anti-bot referral: +bonus to referrer after 10 hands (premium=3000, regular=1000)
     const row = updated[0]
     if (row && row.hands_played >= 10 && row.referred_by && !row.referral_credited) {
+      const bonus = row.referral_bonus || 1000
       await db.query(
-        `UPDATE pf_users SET chips = chips + 1000, referrals_count = referrals_count + 1 WHERE tg_id = $1`,
-        [row.referred_by]
+        `UPDATE pf_users SET chips = chips + $1, referrals_count = referrals_count + 1 WHERE tg_id = $2`,
+        [bonus, row.referred_by]
       ).catch(() => {})
       await db.query(
         `UPDATE pf_users SET referral_credited = TRUE WHERE tg_id = $1`,
         [player.id]
       ).catch(() => {})
-      await logTransaction(row.referred_by, 'referral', 1000, `Referral bonus: ${player.id} completed 10 hands`)
-      console.log(`Referral credited: ${player.id} → referrer ${row.referred_by} +1000`)
+      await logTransaction(row.referred_by, 'referral', bonus, `Referral bonus: ${player.id} completed 10 hands`)
+      console.log(`Referral credited: ${player.id} → referrer ${row.referred_by} +${bonus}`)
     }
   }
   console.log(`Hand saved: winners=${[...winnerIds].join(',')}`)

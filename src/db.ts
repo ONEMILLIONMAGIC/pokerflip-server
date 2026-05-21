@@ -55,6 +55,8 @@ export async function initDB() {
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS last_spin_at TIMESTAMPTZ`).catch(() => {})
   // Referral anti-bot: bonus credited only after referred player plays 10 hands
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS referral_credited BOOLEAN NOT NULL DEFAULT FALSE`).catch(() => {})
+  // referral_bonus: how much the referrer earns (3000 for premium-referred, 1000 for regular)
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS referral_bonus INTEGER NOT NULL DEFAULT 1000`).catch(() => {})
   await db.query(`
     CREATE TABLE IF NOT EXISTS pf_ton_payments (
       boc_hash   TEXT PRIMARY KEY,
