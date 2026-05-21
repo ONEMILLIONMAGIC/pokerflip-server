@@ -371,20 +371,23 @@ app.post('/api/spin', async (req, res) => {
       }
     }
 
-    // 0.1% → 50000, 1% → 10000, rest → 200-1000
+    // CS:GO-style case rarities
     const rand = Math.random()
-    const prizes = [200, 300, 400, 500, 800, 1000]
-    const prize = rand < 0.001 ? 50000
-      : rand < 0.011 ? 10000
-      : prizes[Math.floor(Math.random() * prizes.length)]
+    let rarity: string, pool: number[]
+    if (rand < 0.02)       { rarity = 'red';    pool = [4000, 6000, 10000] }
+    else if (rand < 0.05)  { rarity = 'purple'; pool = [1500, 2000, 2500] }
+    else if (rand < 0.10)  { rarity = 'blue';   pool = [800, 900, 1000] }
+    else if (rand < 0.20)  { rarity = 'green';  pool = [400, 500, 600] }
+    else                   { rarity = 'grey';   pool = [100, 200, 300] }
+    const prize = pool[Math.floor(Math.random() * pool.length)]
 
     const { rows: updated } = await db.query(
       `UPDATE pf_users SET chips = chips + $1, last_spin_at = NOW() WHERE tg_id=$2 RETURNING *`,
       [prize, String(tgUser.id)]
     )
-    await logTransaction(String(tgUser.id), 'spin', prize, `Daily spin: won ${prize.toLocaleString()} chips`)
+    await logTransaction(String(tgUser.id), 'spin', prize, `Daily case: ${rarity} chest · +${prize.toLocaleString()} chips`)
 
-    res.json({ prize, chips: updated[0].chips, jackpot: prize >= 10000 })
+    res.json({ prize, chips: updated[0].chips, rarity })
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'server error' })
