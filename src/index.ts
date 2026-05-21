@@ -304,13 +304,9 @@ app.post('/api/auth', async (req, res) => {
        referrerId]
     )
 
-    // Credit referrer once for new users
-    if (isNew && referrerId) {
-      await db.query(
-        `UPDATE pf_users SET chips = chips + 3000, referrals_count = referrals_count + 1 WHERE tg_id=$1`,
-        [referrerId]
-      )
-    }
+    // Referral bonus is deferred — credited after referred user plays 10 hands
+    // (anti-bot protection: bots must actually play to unlock the bonus)
+    // Logic lives in wsServer.ts saveHandStats()
 
     // Fetch real photo via Bot API (background, don't await)
     if (process.env.BOT_TOKEN) {
