@@ -146,30 +146,12 @@ function handleDisconnect(ws: WebSocket) {
   tables.set(tableId, state)
   broadcastTable(tableId)
 
-  // If it's their turn right now, auto-fold after 3s
-  const isTheirTurn = state.players[state.actionIdx]?.id === playerId
-  if (isTheirTurn && state.street !== 'waiting' && state.street !== 'showdown') {
-    setTimeout(() => {
-      let s = tables.get(tableId)
-      if (!s || s.players[s.actionIdx]?.id !== playerId) return
-      s = applyAction(s, playerId, 'fold')
-      tables.set(tableId, s)
-      clearActionTimer(tableId)
-      broadcastTable(tableId)
-      if (s.street === 'showdown') {
-        saveHandStats(s).catch(console.error)
-        setTimeout(() => {
-          let s2 = tables.get(tableId)
-          if (!s2) return
-          s2 = canStart(s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
-          tables.set(tableId, s2)
-          broadcastTable(tableId)
-          setActionTimer(tableId)
-        }, 4000)
-      } else {
-        setActionTimer(tableId)
-      }
-    }, 3000)
+  // Fold disconnected player quickly — either they're already due to act,
+  // or foldDisconnectedPlayers will handle it when their turn comes.
+  const inActiveHand = state.street !== 'waiting' && state.street !== 'showdown'
+  if (inActiveHand) {
+    // Small delay so state is stable, then resolve stuck hand
+    setTimeout(() => foldDisconnectedPlayers(tableId), 600)
   }
 
   // After 30s without reconnect — actually remove the player slot
@@ -209,8 +191,49 @@ function scheduleStart(tableId: string) {
   startTimers.set(tableId, timer)
 }
 
+// Fold all disconnected players who need to act, until a connected player's turn.
+// Called after any disconnect to quickly resolve stuck hands.
+function foldDisconnectedPlayers(tableId: string) {
+  let s = tables.get(tableId)
+  if (!s || s.street === 'waiting' || s.street === 'showdown') return
+  const p = s.players[s.actionIdx]
+  if (!p || p.folded || p.allIn) return
+  if (p.connected) return // connected player — let them act normally
+
+  clearActionTimer(tableId)
+  s = applyAction(s, p.id, 'fold')
+  tables.set(tableId, s)
+  broadcastTable(tableId)
+
+  if (s.street === 'showdown') {
+    saveHandStats(s).catch(console.error)
+    setTimeout(() => {
+      let s2 = tables.get(tableId)
+      if (!s2) return
+      s2 = canStart(s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
+      tables.set(tableId, s2)
+      broadcastTable(tableId)
+      setActionTimer(tableId)
+    }, 2000) // shorter delay when auto-resolved
+  } else {
+    // Recurse — next player might also be disconnected
+    setTimeout(() => foldDisconnectedPlayers(tableId), 150)
+    setActionTimer(tableId)
+  }
+}
+
 function setActionTimer(tableId: string) {
   clearActionTimer(tableId)
+  let state = tables.get(tableId)
+  if (state) {
+    const p = state.players[state.actionIdx]
+    // Disconnected player at the wheel — fold them immediately (no 30s wait)
+    if (p && !p.folded && !p.allIn && !p.connected) {
+      const timer = setTimeout(() => foldDisconnectedPlayers(tableId), 800)
+      actionTimers.set(tableId, timer)
+      return
+    }
+  }
   const timer = setTimeout(() => {
     let state = tables.get(tableId)
     if (!state || state.street === 'waiting' || state.street === 'showdown') return
