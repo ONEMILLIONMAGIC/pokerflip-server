@@ -113,6 +113,27 @@ function handleMessage(ws: WebSocket, msg: any) {
     return
   }
 
+  // Emoji reaction — broadcast to all at table
+  if (type === 'reaction') {
+    const emoji = String(msg.emoji || '👏').slice(0, 2)
+    broadcastToTable(tableId, { type: 'reaction', playerId, playerName: client.playerName, emoji })
+    return
+  }
+
+  // Show own cards voluntarily (after fold or at showdown)
+  if (type === 'show_cards') {
+    const { tableId, playerId } = client
+    const state = tables.get(tableId)
+    if (!state) return
+    const player = state.players.find(p => p.id === playerId)
+    if (!player || !player.holeCards?.length) return
+    const count = Number(msg.count) === 1 ? 1 : 2
+    const cards = player.holeCards.filter(c => (c.rank as string) !== '?').slice(0, count)
+    if (!cards.length) return
+    broadcastToTable(tableId, { type: 'cards_shown', playerId, playerName: client.playerName, cards })
+    return
+  }
+
   if (type === 'ping') {
     send(ws, { type: 'pong' })
     return
