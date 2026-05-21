@@ -300,11 +300,34 @@ export function getTableStats(): Record<string, { players: number; maxPlayers: n
   return stats
 }
 
+const TOURNAMENT_TABLE_IDS = new Set(['daily', 'weekly'])
+
 async function handleJoin(ws: WebSocket, msg: any) {
   const { tableId = 'main', playerId, playerName, buyIn: requestedBuyIn } = msg
   if (!playerId || !playerName) return send(ws, { type: 'error', message: 'Need playerId and playerName' })
 
   const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main
+
+  // Tournament access control: only registered players during active status
+  if (TOURNAMENT_TABLE_IDS.has(tableId) && process.env.DATABASE_URL) {
+    try {
+      const db = getPool()
+      const [statusRes, regRes] = await Promise.all([
+        db.query(`SELECT status FROM pf_tournament_status WHERE tournament_id=$1`, [tableId]),
+        db.query(`SELECT 1 FROM pf_tournament_regs WHERE tournament_id=$1 AND tg_id=$2`, [tableId, playerId]),
+      ])
+      const status = statusRes.rows[0]?.status || 'pending'
+      const isRegistered = regRes.rows.length > 0
+      if (status !== 'active') {
+        return send(ws, { type: 'error', message: 'Tournament has not started yet', code: 'tournament_not_active' })
+      }
+      if (!isRegistered) {
+        return send(ws, { type: 'error', message: 'You are not registered for this tournament', code: 'tournament_not_registered' })
+      }
+    } catch (e) {
+      console.error('Tournament access check error:', e)
+    }
+  }
 
   // Load total chips from DB
   let totalChips = config.minBuyIn
@@ -430,4 +453,71 @@ async function saveHandStats(state: GameState) {
     }
   }
   console.log(`Hand saved: winners=${[...winnerIds].join(',')}`)
+
+  // Tournament end: if only 1 player has chips left → distribute prizes
+  if (TOURNAMENT_TABLE_IDS.has(state.tableId)) {
+    await checkTournamentEnd(state).catch(e => console.error('Tournament end check error:', e))
+  }
+}
+
+async function checkTournamentEnd(state: GameState) {
+  const db = getPool()
+  const tableId = state.tableId
+  // Players with 0 chips are eliminated
+  const alive = state.players.filter(p => {
+    const bank = playerBanks.get(`${tableId}:${p.id}`) ?? 0
+    return (bank + p.chips) > 0
+  })
+  if (alive.length > 1) return // still playing
+
+  // Get tournament prize pool
+  const { rows: regRows } = await db.query(
+    `SELECT COUNT(*) as cnt FROM pf_tournament_regs WHERE tournament_id=$1`, [tableId]
+  ).catch(() => ({ rows: [{ cnt: 0 }] }))
+  const registered = Number(regRows[0]?.cnt || 0)
+
+  const CONFIGS: Record<string, { basePrize: number; buyIn: number }> = {
+    daily:  { basePrize: 50_000, buyIn: 2_000 },
+    weekly: { basePrize: 300_000, buyIn: 5_000 },
+  }
+  const cfg = CONFIGS[tableId]
+  if (!cfg) return
+  const prizePool = Math.max(cfg.basePrize, registered * cfg.buyIn)
+
+  // Calculate prize tiers (same logic as index.ts)
+  const tiers =
+    registered <= 4  ? [{ place: 1, pct: 60 }, { place: 2, pct: 40 }]
+    : registered <= 8  ? [{ place: 1, pct: 50 }, { place: 2, pct: 30 }, { place: 3, pct: 20 }]
+    :                    [{ place: 1, pct: 40 }, { place: 2, pct: 25 }, { place: 3, pct: 15 }, { place: 4, pct: 12 }, { place: 5, pct: 8 }]
+
+  // Winner is the last alive player
+  const winner = alive[0] || state.players[0]
+  if (!winner) return
+
+  // Award winner
+  const winnerPrize = Math.floor(prizePool * tiers[0].pct / 100)
+  await db.query(
+    `UPDATE pf_users SET chips = chips + $1, tournaments_won = tournaments_won + 1 WHERE tg_id=$2`,
+    [winnerPrize, winner.id]
+  ).catch(() => {})
+  await logTransaction(winner.id, 'tournament_win', winnerPrize, `Won ${tableId} tournament! 🏆 +${winnerPrize.toLocaleString()} chips`)
+
+  // Mark tournament as finished, reset registrations for next cycle
+  await db.query(
+    `UPDATE pf_tournament_status SET status='finished' WHERE tournament_id=$1`, [tableId]
+  ).catch(() => {})
+  await db.query(
+    `DELETE FROM pf_tournament_regs WHERE tournament_id=$1`, [tableId]
+  ).catch(() => {})
+
+  console.log(`Tournament ${tableId} ended! Winner: ${winner.id}, prize: ${winnerPrize}`)
+
+  // Broadcast tournament end to all players at the table
+  broadcastToTable(tableId, {
+    type: 'tournament_end',
+    winnerId: winner.id,
+    winnerName: winner.name,
+    prize: winnerPrize,
+    tableId,
+  })
 }
