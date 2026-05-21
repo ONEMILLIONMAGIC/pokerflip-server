@@ -304,9 +304,22 @@ app.post('/api/auth', async (req, res) => {
        referrerId]
     )
 
-    // Referral bonus is deferred — credited after referred user plays 10 hands
-    // (anti-bot protection: bots must actually play to unlock the bonus)
-    // Logic lives in wsServer.ts saveHandStats()
+    // Referral bonus:
+    // • Premium user  → instant +3000 to referrer (Telegram Premium = real verified user)
+    // • Regular user  → deferred: +1000 to referrer after 10 hands played (anti-bot)
+    if (isNew && referrerId) {
+      const isPremium = tgUser.is_premium === true
+      if (isPremium) {
+        await db.query(
+          `UPDATE pf_users SET chips = chips + 3000, referrals_count = referrals_count + 1 WHERE tg_id=$1`,
+          [referrerId]
+        ).catch(() => {})
+        await db.query(`UPDATE pf_users SET referral_credited = TRUE WHERE tg_id=$1`, [tgId]).catch(() => {})
+        await logTransaction(referrerId, 'referral', 3000, `Premium referral: ${tgId} joined instantly`)
+        console.log(`Premium referral credited instantly: ${tgId} → ${referrerId} +3000`)
+      }
+      // Non-premium: deferred credit in wsServer.ts saveHandStats() after 10 hands → +1000
+    }
 
     // Fetch real photo via Bot API (background, don't await)
     if (process.env.BOT_TOKEN) {

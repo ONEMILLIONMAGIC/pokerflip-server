@@ -33,7 +33,7 @@ export function validateTgInitData(initData: string): Record<string, string> | n
 export function parseTgUser(params: Record<string, string>) {
   try {
     return JSON.parse(params.user || '{}') as {
-      id: number; first_name?: string; username?: string; photo_url?: string
+      id: number; first_name?: string; username?: string; photo_url?: string; is_premium?: boolean
     }
   } catch {
     return null

@@ -413,19 +413,19 @@ async function saveHandStats(state: GameState) {
       await logTransaction(player.id, 'win', wonAmount, `Won hand at table ${state.tableId}`)
     }
 
-    // Anti-bot referral: credit referrer only after referred user plays 10 hands
+    // Anti-bot referral (non-premium): +1000 to referrer after 10 hands
     const row = updated[0]
     if (row && row.hands_played >= 10 && row.referred_by && !row.referral_credited) {
       await db.query(
-        `UPDATE pf_users SET chips = chips + 3000, referrals_count = referrals_count + 1 WHERE tg_id = $1`,
+        `UPDATE pf_users SET chips = chips + 1000, referrals_count = referrals_count + 1 WHERE tg_id = $1`,
         [row.referred_by]
       ).catch(() => {})
       await db.query(
         `UPDATE pf_users SET referral_credited = TRUE WHERE tg_id = $1`,
         [player.id]
       ).catch(() => {})
-      await logTransaction(row.referred_by, 'referral', 3000, `Referral bonus: ${player.id} completed 10 hands`)
-      console.log(`Referral credited: ${player.id} → referrer ${row.referred_by} +3000`)
+      await logTransaction(row.referred_by, 'referral', 1000, `Referral bonus: ${player.id} completed 10 hands`)
+      console.log(`Referral credited: ${player.id} → referrer ${row.referred_by} +1000`)
     }
   }
   console.log(`Hand saved: winners=${[...winnerIds].join(',')}`)
