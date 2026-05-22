@@ -167,12 +167,9 @@ function handleDisconnect(ws: WebSocket) {
   tables.set(tableId, state)
   broadcastTable(tableId)
 
-  // Fold disconnected player quickly — either they're already due to act,
-  // or foldDisconnectedPlayers will handle it when their turn comes.
   const inActiveHand = state.street !== 'waiting' && state.street !== 'showdown'
   if (inActiveHand) {
-    // Small delay so state is stable, then resolve stuck hand
-    setTimeout(() => foldDisconnectedPlayers(tableId), 600)
+    setTimeout(() => resolveHandAfterDisconnect(tableId), 600)
   }
 
   // After 30s without reconnect — actually remove the player slot
@@ -210,6 +207,51 @@ function scheduleStart(tableId: string) {
     setActionTimer(tableId)
   }, 3000)
   startTimers.set(tableId, timer)
+}
+
+// If only 1 connected non-folded player remains, end the hand immediately and give them the pot.
+// Otherwise fall back to foldDisconnectedPlayers.
+function resolveHandAfterDisconnect(tableId: string) {
+  let s = tables.get(tableId)
+  if (!s || s.street === 'waiting' || s.street === 'showdown') return
+
+  const connectedActive = s.players.filter(p => p.connected && !p.folded)
+
+  if (connectedActive.length <= 1) {
+    clearActionTimer(tableId)
+    // Fold all disconnected non-folded players
+    const players = s.players.map(p =>
+      (!p.connected && !p.folded) ? { ...p, folded: true, hasActed: true } : { ...p }
+    )
+    const notFolded = players.filter(p => !p.folded)
+    let newState: typeof s = { ...s, players }
+
+    if (notFolded.length === 1) {
+      const winner = notFolded[0]
+      players.find(p => p.id === winner.id)!.chips += newState.pot
+      newState = { ...newState, players, winners: [{ playerId: winner.id, amount: newState.pot, hand: 'Last standing' }], pot: 0, street: 'showdown' }
+    } else {
+      newState = { ...newState, street: 'waiting' }
+    }
+
+    tables.set(tableId, newState)
+    broadcastTable(tableId)
+
+    if (newState.street === 'showdown') {
+      saveHandStats(newState).catch(console.error)
+      setTimeout(() => {
+        let s2 = tables.get(tableId)
+        if (!s2) return
+        s2 = canStart(s2) ? startHand(s2) : { ...s2, street: 'waiting' }
+        tables.set(tableId, s2)
+        broadcastTable(tableId)
+      }, 2000)
+    }
+    return
+  }
+
+  // Multiple connected players remain — use normal per-turn fold logic
+  foldDisconnectedPlayers(tableId)
 }
 
 // Fold all disconnected players who need to act, until a connected player's turn.
