@@ -216,12 +216,38 @@ function resolveShowdown(s: GameState): GameState {
     result: evaluate([...p.holeCards, ...s.board]),
   }))
 
-  results.sort((a, b) => compareHands(b.result, a.result))
-  const winner = results[0]
+  // Log showdown details for debugging
+  const boardStr = s.board.map(c => `${c.rank}${c.suit}`).join(' ')
+  for (const r of results) {
+    const hole = r.player.holeCards.map(c => `${c.rank}${c.suit}`).join(' ')
+    console.log(`[Showdown] ${r.player.name}: hole=[${hole}] board=[${boardStr}] → ${r.result.name} (score=${r.result.score})`)
+  }
 
-  // Simple: winner takes all (no side pots for MVP)
-  winner.player.chips += s.pot
-  s.winners = [{ playerId: winner.player.id, amount: s.pot, hand: winner.result.name }]
+  results.sort((a, b) => compareHands(b.result, a.result))
+
+  // Handle split pot (ties)
+  const topScore = results[0].result.score
+  const winners = results.filter(r => r.result.score === topScore)
+
+  if (winners.length > 1) {
+    const share = Math.floor(s.pot / winners.length)
+    const remainder = s.pot - share * winners.length
+    for (let i = 0; i < winners.length; i++) {
+      winners[i].player.chips += share + (i === 0 ? remainder : 0)
+    }
+    s.winners = winners.map((w, i) => ({
+      playerId: w.player.id,
+      amount: share + (i === 0 ? remainder : 0),
+      hand: w.result.name,
+    }))
+    console.log(`[Showdown] SPLIT POT: ${winners.map(w=>w.player.name).join(' & ')} each get ${share}`)
+  } else {
+    const winner = results[0]
+    winner.player.chips += s.pot
+    s.winners = [{ playerId: winner.player.id, amount: s.pot, hand: winner.result.name }]
+    console.log(`[Showdown] WINNER: ${winner.player.name} with ${winner.result.name} (score=${winner.result.score})`)
+  }
+
   s.pot = 0
   return s
 }
