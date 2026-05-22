@@ -78,7 +78,7 @@ app.post('/api/webhook', async (req, res) => {
         )
       } catch {}
 
-      const bannerUrl = `${CLIENT_URL}/banner_${lang}.png`
+      const bannerUrl = `${CLIENT_URL}/banner_${lang}_v2.png`
       await tgSendPhoto(chatId, bannerUrl, WELCOME[lang](firstName), { reply_markup: startBtn })
     }
 
