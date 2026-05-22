@@ -137,7 +137,28 @@ app.post('/api/webhook', async (req, res) => {
     // Admin commands (only for admin tgId)
     else if (String(chatId) === (process.env.ADMIN_TG_ID || '501197162')) {
       const db = getPool()
-      if (text?.startsWith('/admin start ')) {
+      if (text?.startsWith('/admin credit ')) {
+        // /admin credit <tgId> <amount> [reason]
+        const parts = text.split(' ')
+        const targetId = parts[2]?.trim()
+        const amount = parseInt(parts[3] || '0')
+        const reason = parts.slice(4).join(' ') || 'Admin credit'
+        if (!targetId || !amount || amount <= 0) {
+          await tgSend(chatId, '❌ Usage: /admin credit <tgId> <amount> [reason]')
+        } else {
+          const { rows } = await db.query(
+            'UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING first_name, chips',
+            [amount, targetId]
+          )
+          if (!rows[0]) {
+            await tgSend(chatId, `❌ User ${targetId} not found`)
+          } else {
+            await logTransaction(targetId, 'admin', amount, reason)
+            await tgSend(chatId, `✅ Credited *+${amount.toLocaleString()} chips* to ${rows[0].first_name}\nNew balance: *${rows[0].chips.toLocaleString()} chips*`)
+            await tgSend(targetId, `🎁 *+${amount.toLocaleString()} chips* от администратора!\n_${reason}_`, { reply_markup: PLAY_BTN })
+          }
+        }
+      } else if (text?.startsWith('/admin start ')) {
         const id = text.split(' ')[2]?.trim()
         if (!['daily', 'weekly'].includes(id)) {
           await tgSend(chatId, '❌ Unknown tournament. Use: daily or weekly')
