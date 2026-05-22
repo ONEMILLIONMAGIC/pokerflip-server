@@ -57,6 +57,8 @@ export async function initDB() {
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS referral_credited BOOLEAN NOT NULL DEFAULT FALSE`).catch(() => {})
   // referral_bonus: how much the referrer earns (3000 for premium-referred, 1000 for regular)
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS referral_bonus INTEGER NOT NULL DEFAULT 1000`).catch(() => {})
+  // lang: user's preferred language (ru/en/it), set on /start from Telegram language_code
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS lang VARCHAR(2) NOT NULL DEFAULT 'en'`).catch(() => {})
   await db.query(`
     CREATE TABLE IF NOT EXISTS pf_ton_payments (
       boc_hash   TEXT PRIMARY KEY,
@@ -81,9 +83,12 @@ export async function initDB() {
       tg_id         TEXT NOT NULL,
       tournament_id TEXT NOT NULL,
       registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      cycle_key     TEXT NOT NULL DEFAULT '',
       PRIMARY KEY (tg_id, tournament_id)
     )
   `)
+  // Migration: add cycle_key to existing tables
+  await db.query(`ALTER TABLE pf_tournament_regs ADD COLUMN IF NOT EXISTS cycle_key TEXT NOT NULL DEFAULT ''`).catch(() => {})
 
   // Tournament lifecycle status
   await db.query(`

@@ -29,6 +29,24 @@ async function tgSend(chatId: number | string, text: string, extra: object = {})
   }).catch(() => {})
 }
 
+async function tgSendPhoto(chatId: number | string, photoUrl: string, caption: string, extra: object = {}) {
+  const botToken = process.env.BOT_TOKEN
+  if (!botToken) return
+  await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption, parse_mode: 'Markdown', ...extra })
+  }).catch(() => {})
+}
+
+const CLIENT_URL = 'https://pokerflip-client.onrender.com'
+
+const WELCOME: Record<string, (name: string) => string> = {
+  ru: (name) => `♠️ Добро пожаловать в *PokerFlip*, ${name}!\n\nИграй в Texas Hold'em прямо в Telegram.\n\n🎁 *3,000 фишек* на старт\n⏰ *+500 фишек* каждые 6 часов\n🎰 Ежедневный барабан — до *50,000 фишек*!\n👥 Приглашай друзей → *+3,000 фишек* каждый\n\nПрисоединяйся к столам, поднимайся в рейтинге, выигрывай турниры!`,
+  it: (name) => `♠️ Benvenuto in *PokerFlip*, ${name}!\n\nGioca a Texas Hold'em direttamente su Telegram.\n\n🎁 *3,000 gettoni* per iniziare\n⏰ *+500 gettoni* ogni 6 ore\n🎰 Ruota giornaliera — fino a *50,000 gettoni*!\n👥 Invita amici → *+3,000 gettoni* ciascuno\n\nUnisciti ai tavoli, scala la classifica, vinci tornei!`,
+  en: (name) => `♠️ Welcome to *PokerFlip*, ${name}!\n\nPlay Texas Hold'em poker with free chips.\n\n🎁 *3,000 chips* to start\n⏰ Claim *+500 chips* every 6 hours\n🎰 Daily spin wheel — up to *50,000 chips*!\n👥 Invite friends → *+3,000 chips* each\n\nJoin tables, climb the leaderboard, win tournaments!`,
+}
+
 // Telegram bot webhook
 app.post('/api/webhook', async (req, res) => {
   res.sendStatus(200)
@@ -43,13 +61,25 @@ app.post('/api/webhook', async (req, res) => {
     const firstName = msg.from?.first_name || 'Player'
 
     if (text.startsWith('/start')) {
-      // Parse referral param: "/start 8003578355" → refId = "8003578355"
       const refId = text.slice(6).trim()
       const btnUrl = refId ? `${TMA_URL}?startapp=${refId}` : TMA_URL
       const startBtn = { inline_keyboard: [[{ text: '♠️ Play Now', web_app: { url: btnUrl } }]] }
-      await tgSend(chatId,
-        `♠️ Welcome to *PokerFlip*, ${firstName}!\n\nPlay Texas Hold'em poker with free chips.\n\n🎁 *3,000 chips* to start\n⏰ Claim *+500 chips* every 6 hours\n🎰 Daily spin wheel — up to *50,000 chips*!\n👥 Invite friends → *+3,000 chips* each\n\nJoin tables, climb the leaderboard, win tournaments!`,
-        { reply_markup: startBtn })
+
+      // Detect language from Telegram user object
+      const rawLang = (msg.from?.language_code || 'en').slice(0, 2).toLowerCase()
+      const lang = rawLang === 'ru' ? 'ru' : rawLang === 'it' ? 'it' : 'en'
+
+      // Save language preference to DB (best-effort)
+      try {
+        const db = getPool()
+        await db.query(
+          `UPDATE pf_users SET lang=$1 WHERE tg_id=$2`,
+          [lang, tgId]
+        )
+      } catch {}
+
+      const bannerUrl = `${CLIENT_URL}/banner_${lang}.png`
+      await tgSendPhoto(chatId, bannerUrl, WELCOME[lang](firstName), { reply_markup: startBtn })
     }
 
     else if (text === '/stats' || text === '/balance') {
@@ -164,12 +194,23 @@ app.get('/api/notify', async (req, res) => {
     const db = getPool()
     // Users who haven't logged in for 20-48 hours and have claimable chips
     const { rows } = await db.query(`
-      SELECT tg_id, first_name, chips, claimed_at, last_spin_at
+      SELECT tg_id, first_name, chips, claimed_at, last_spin_at, lang
       FROM pf_users
       WHERE last_login_date < CURRENT_DATE - INTERVAL '1 day'
         AND last_login_date >= CURRENT_DATE - INTERVAL '3 days'
       LIMIT 200
     `)
+
+    const NOTIFY_TEXT: Record<string, (name: string, chips: string, parts: string[]) => string> = {
+      ru: (name, chips, parts) => `👋 Привет, ${name}!\n\n${parts.join('\n')}\n\nТебя ждут *${chips} фишек*.`,
+      it: (name, chips, parts) => `👋 Ciao, ${name}!\n\n${parts.join('\n')}\n\nHai *${chips} gettoni* che ti aspettano.`,
+      en: (name, chips, parts) => `👋 Hey ${name}!\n\n${parts.join('\n')}\n\nYou have *${chips} chips* waiting.`,
+    }
+    const NOTIFY_PARTS: Record<string, { claim: string; spin: string }> = {
+      ru: { claim: '⏰ Бесплатные фишки готовы к получению!', spin: '🎰 Доступен ежедневный барабан!' },
+      it: { claim: '⏰ Gettoni gratuiti pronti da riscuotere!', spin: '🎰 Ruota giornaliera disponibile!' },
+      en: { claim: '⏰ Free chips ready to claim!', spin: '🎰 Daily spin wheel available!' },
+    }
 
     let sent = 0
     for (const u of rows) {
@@ -177,12 +218,14 @@ app.get('/api/notify', async (req, res) => {
       const canSpin = !u.last_spin_at || Date.now() - new Date(u.last_spin_at).getTime() >= 86400000
       if (!canClaim && !canSpin) continue
 
+      const lang = u.lang && ['ru', 'it', 'en'].includes(u.lang) ? u.lang : 'en'
+      const p = NOTIFY_PARTS[lang]
       const parts = []
-      if (canClaim) parts.push('⏰ Free chips ready to claim!')
-      if (canSpin) parts.push('🎰 Daily spin wheel available!')
+      if (canClaim) parts.push(p.claim)
+      if (canSpin) parts.push(p.spin)
 
       await tgSend(u.tg_id,
-        `👋 Hey ${u.first_name || 'Player'}!\n\n${parts.join('\n')}\n\nYou have *${u.chips.toLocaleString()} chips* waiting.`,
+        NOTIFY_TEXT[lang](u.first_name || (lang === 'ru' ? 'Игрок' : lang === 'it' ? 'Giocatore' : 'Player'), u.chips.toLocaleString(), parts),
         { reply_markup: PLAY_BTN }
       )
       sent++
