@@ -292,8 +292,14 @@ export function removePlayer(state: GameState, id: string): GameState {
 // Mask hole cards for a specific viewer (hide opponent cards)
 export function maskForPlayer(state: GameState, viewerId: string): GameState {
   const s = deepClone(state)
+  // All-in players show cards if no more betting action is possible
+  const activeBettors = s.players.filter(p => !p.folded && !p.allIn)
+  const allInShowdown = activeBettors.length <= 1 // all remaining are all-in → show cards
+
   for (const p of s.players) {
     if (p.id !== viewerId && s.street !== 'showdown') {
+      // Keep cards visible if player is all-in and board is being run out
+      if (p.allIn && allInShowdown) continue
       p.holeCards = p.holeCards.map(() => ({ rank: '?', suit: '?' } as any))
     }
   }
