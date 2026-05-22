@@ -394,6 +394,7 @@ async function handleJoin(ws: WebSocket, msg: any) {
     broadcastTable(tableId)
     send(ws, { type: 'joined', playerId, tableId, chips: reconnectingPlayer.chips, maxPlayers })
     console.log(`Player ${playerId} reconnected to ${tableId} with ${reconnectingPlayer.chips} chips`)
+    scheduleStart(tableId)
     return
   }
 
