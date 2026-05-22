@@ -222,6 +222,12 @@ function resolveShowdown(s: GameState): GameState {
     const hole = r.player.holeCards.map(c => `${c.rank}${c.suit}`).join(' ')
     console.log(`[Showdown] ${r.player.name}: hole=[${hole}] board=[${boardStr}] → ${r.result.name} (score=${r.result.score})`)
   }
+  // Also log folded players so we can see if they had strong hands
+  for (const p of s.players.filter(p => p.folded && p.holeCards.length > 0)) {
+    const hole = p.holeCards.map(c => `${c.rank}${c.suit}`).join(' ')
+    const ev = evaluate([...p.holeCards, ...s.board])
+    console.log(`[Showdown] ${p.name} (FOLDED): hole=[${hole}] board=[${boardStr}] → would have had ${ev.name} (score=${ev.score})`)
+  }
 
   results.sort((a, b) => compareHands(b.result, a.result))
 
