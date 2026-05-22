@@ -59,6 +59,19 @@ export async function initDB() {
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS referral_bonus INTEGER NOT NULL DEFAULT 1000`).catch(() => {})
   // lang: user's preferred language (ru/en/it), set on /start from Telegram language_code
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS lang VARCHAR(2) NOT NULL DEFAULT 'en'`).catch(() => {})
+  // Hand history
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS pf_hand_history (
+      id         SERIAL PRIMARY KEY,
+      table_id   TEXT NOT NULL,
+      board      JSONB NOT NULL,
+      players    JSONB NOT NULL,
+      winners    JSONB NOT NULL,
+      pot        INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `).catch(() => {})
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_hand_history_table ON pf_hand_history(table_id, created_at DESC)`).catch(() => {})
   await db.query(`
     CREATE TABLE IF NOT EXISTS pf_ton_payments (
       boc_hash   TEXT PRIMARY KEY,

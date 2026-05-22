@@ -818,6 +818,18 @@ app.get('/api/achievements', async (req, res) => {
   }
 })
 
+// GET /api/hand-history/:tableId — last 20 hands at this table
+app.get('/api/hand-history/:tableId', async (req, res) => {
+  try {
+    const db = getPool()
+    const { rows } = await db.query(
+      `SELECT id, board, players, winners, pot, created_at FROM pf_hand_history WHERE table_id=$1 ORDER BY created_at DESC LIMIT 20`,
+      [req.params.tableId]
+    )
+    res.json(rows)
+  } catch (e) { res.status(500).json({ error: 'server error' }) }
+})
+
 // GET /api/leaderboard?period=all|weekly
 app.get('/api/leaderboard', async (req, res) => {
   try {

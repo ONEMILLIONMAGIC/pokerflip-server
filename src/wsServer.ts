@@ -134,6 +134,42 @@ function handleMessage(ws: WebSocket, msg: any) {
     return
   }
 
+  if (type === 'rebuy') {
+    const amount = Math.floor(Number(msg.amount))
+    const bankKey = `${tableId}:${playerId}`
+    const bank = playerBanks.get(bankKey) ?? 0
+    const cfg = TABLE_CONFIG[tableId] || TABLE_CONFIG.main
+
+    if (!amount || amount <= 0) return send(ws, { type: 'error', code: 'rebuy_failed', message: 'Invalid amount' })
+    if (amount > bank) return send(ws, { type: 'error', code: 'insufficient_chips', required: amount, have: bank })
+    if (amount < cfg.minBuyIn) return send(ws, { type: 'error', code: 'rebuy_failed', message: `Min rebuy: ${cfg.minBuyIn}` })
+
+    let state = tables.get(tableId)
+    if (!state) return
+    const playerInState = state.players.find(p => p.id === playerId)
+    if (!playerInState) return
+
+    // Move amount from bank → table chips
+    const newBank = bank - amount
+    playerBanks.set(bankKey, newBank)
+    const newPlayers = state.players.map(p =>
+      p.id === playerId ? { ...p, chips: p.chips + amount, folded: false, allIn: false } : p
+    )
+    state = { ...state, players: newPlayers }
+    tables.set(tableId, state)
+
+    // Sync DB: bank decreased by amount
+    if (process.env.DATABASE_URL) {
+      getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => {})
+      logTransaction(playerId, 'table_join', -amount, `Re-buy at ${tableId} (+${amount.toLocaleString()} chips)`)
+    }
+
+    broadcastTable(tableId)
+    send(ws, { type: 'rebuy_ok', chips: playerInState.chips + amount, bank: newBank })
+    scheduleStart(tableId)
+    return
+  }
+
   if (type === 'ping') {
     send(ws, { type: 'pong' })
     return
@@ -466,7 +502,7 @@ async function handleJoin(ws: WebSocket, msg: any) {
   }
 
   broadcastTable(tableId)
-  send(ws, { type: 'joined', playerId, tableId, chips: playerChips, maxPlayers })
+  send(ws, { type: 'joined', playerId, tableId, chips: playerChips, maxPlayers, bank: bankChips })
   scheduleStart(tableId)
 }
 
@@ -517,6 +553,20 @@ async function saveHandStats(state: GameState) {
     }
   }
   console.log(`Hand saved: winners=${[...winnerIds].join(',')}`)
+
+  // Save full hand history for replay/debugging
+  const historyPlayers = state.players.filter(p => p.holeCards?.length > 0).map(p => ({
+    id: p.id, name: p.name,
+    holeCards: p.holeCards,
+    folded: p.folded,
+    won: winnerIds.has(p.id),
+    wonAmount: state.winners.find(w => w.playerId === p.id)?.amount || 0,
+    hand: winnerIds.has(p.id) ? (state.winners.find(w => w.playerId === p.id)?.hand || '') : '',
+  }))
+  db.query(
+    `INSERT INTO pf_hand_history (table_id, board, players, winners, pot) VALUES ($1,$2,$3,$4,$5)`,
+    [state.tableId, JSON.stringify(state.board), JSON.stringify(historyPlayers), JSON.stringify(state.winners), state.pot + (state.winners.reduce((s,w) => s+w.amount, 0))]
+  ).catch(() => {})
 
   // Tournament end: if only 1 player has chips left → distribute prizes
   if (TOURNAMENT_TABLE_IDS.has(state.tableId)) {
