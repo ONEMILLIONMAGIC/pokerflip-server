@@ -120,15 +120,17 @@ function handleMessage(ws: WebSocket, msg: any) {
     return
   }
 
-  // Show own cards voluntarily (after fold or at showdown)
+  // Show own cards voluntarily — supports specific card indices
   if (type === 'show_cards') {
     const { tableId, playerId } = client
     const state = tables.get(tableId)
     if (!state) return
     const player = state.players.find(p => p.id === playerId)
     if (!player || !player.holeCards?.length) return
-    const count = Number(msg.count) === 1 ? 1 : 2
-    const cards = player.holeCards.filter(c => (c.rank as string) !== '?').slice(0, count)
+    const indices: number[] = Array.isArray(msg.indices)
+      ? msg.indices.filter((i: any) => i === 0 || i === 1)
+      : (Number(msg.count) === 1 ? [0] : [0, 1])
+    const cards = player.holeCards.filter((c, i) => indices.includes(i) && (c.rank as string) !== '?')
     if (!cards.length) return
     broadcastToTable(tableId, { type: 'cards_shown', playerId, playerName: client.playerName, cards })
     return
