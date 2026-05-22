@@ -189,6 +189,62 @@ app.post('/api/webhook', async (req, res) => {
       } else if (text === '/admin spin') {
         await db.query(`UPDATE pf_users SET last_spin_at = NULL WHERE tg_id=$1`, [String(chatId)])
         await tgSend(chatId, `✅ Daily spin reset. Open the app to spin!`, { reply_markup: PLAY_BTN })
+
+      } else if (text?.startsWith('/admin lookup ')) {
+        // /admin lookup <name_or_username>
+        const q = text.split(' ').slice(2).join(' ').trim()
+        const { rows } = await db.query(
+          `SELECT tg_id, first_name, username, chips, hands_played, referred_by, referral_credited, referral_bonus
+           FROM pf_users WHERE first_name ILIKE $1 OR username ILIKE $1 LIMIT 5`,
+          [`%${q}%`]
+        )
+        if (!rows.length) {
+          await tgSend(chatId, `❌ No users found for "${q}"`)
+        } else {
+          const lines = rows.map((r: any) =>
+            `*${r.first_name}* (@${r.username || '—'}) id: \`${r.tg_id}\`\n` +
+            `chips: ${r.chips?.toLocaleString()} | hands: ${r.hands_played}\n` +
+            `referred_by: ${r.referred_by || '—'} | bonus: ${r.referral_bonus || 0} | credited: ${r.referral_credited}`
+          )
+          await tgSend(chatId, `🔍 *Found ${rows.length} user(s):*\n\n${lines.join('\n\n')}`)
+        }
+
+      } else if (text?.startsWith('/admin referral ')) {
+        // /admin referral <tg_id> <referrer_id> — manually set referral for existing user
+        const parts = text.split(' ')
+        const targetId = parts[2]?.trim()
+        const referrerId2 = parts[3]?.trim()
+        if (!targetId || !referrerId2) {
+          await tgSend(chatId, '❌ Usage: /admin referral <user_tg_id> <referrer_tg_id>')
+        } else {
+          // Check target exists
+          const { rows: targetRows } = await db.query(
+            'SELECT tg_id, first_name, referred_by, referral_bonus, referral_credited FROM pf_users WHERE tg_id=$1', [targetId]
+          )
+          if (!targetRows[0]) {
+            await tgSend(chatId, `❌ User ${targetId} not found`)
+          } else {
+            const u = targetRows[0]
+            // Set referred_by and bonus (only if not already credited)
+            const { rows: updated } = await db.query(
+              `UPDATE pf_users SET
+                 referred_by = $1,
+                 referral_bonus = CASE WHEN referral_bonus IS NULL OR referral_bonus = 0 THEN $2 ELSE referral_bonus END
+               WHERE tg_id=$3 AND NOT referral_credited
+               RETURNING first_name, referred_by, referral_bonus`,
+              [referrerId2, 3000, targetId]  // default premium bonus for Kseniya
+            )
+            if (!updated[0]) {
+              await tgSend(chatId, `⚠️ ${u.first_name} already has referral credited or not found`)
+            } else {
+              await tgSend(chatId,
+                `✅ Referral set for *${updated[0].first_name}*\n` +
+                `referred_by: ${updated[0].referred_by}\n` +
+                `bonus queued: ${updated[0].referral_bonus} chips (will credit on next hand)`)
+            }
+          }
+        }
+
       } else if (text === '/admin') {
         await tgSend(chatId,
           `🔧 *Admin Commands*\n\n` +
@@ -196,7 +252,10 @@ app.post('/api/webhook', async (req, res) => {
           `/admin start weekly — force start Weekly tournament\n` +
           `/admin end daily — reset tournament to pending\n` +
           `/admin stats — tournament & registration status\n` +
-          `/admin spin — reset daily spin for yourself`)
+          `/admin spin — reset daily spin for yourself\n` +
+          `/admin lookup <name> — find user by name/username\n` +
+          `/admin referral <user_id> <referrer_id> — manually set referral\n` +
+          `/admin credit <tgId> <amount> [reason] — credit chips`)
       }
     }
 
@@ -549,20 +608,24 @@ app.post('/api/auth', async (req, res) => {
     const tgId = String(tgUser.id)
     const db = getPool()
 
-    // Check if new user
-    const existing = await db.query('SELECT tg_id FROM pf_users WHERE tg_id=$1', [tgId])
-    const isNew = existing.rows.length === 0
-
     // Referrer: startParam is referrer's tg_id (don't self-refer)
     const referrerId = startParam && startParam !== tgId ? startParam : null
+
+    // Check if user exists and whether they already have a referral set
+    const existing = await db.query(
+      'SELECT tg_id, referred_by, referral_bonus, referral_credited FROM pf_users WHERE tg_id=$1', [tgId]
+    )
+    const isNew = existing.rows.length === 0
+    const hadReferral = existing.rows[0]?.referred_by != null
 
     const { rows } = await db.query(
       `INSERT INTO pf_users (tg_id, username, first_name, photo_url, referred_by)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (tg_id) DO UPDATE SET
-         username   = EXCLUDED.username,
-         first_name = EXCLUDED.first_name,
-         photo_url  = COALESCE(EXCLUDED.photo_url, pf_users.photo_url)
+         username    = EXCLUDED.username,
+         first_name  = EXCLUDED.first_name,
+         photo_url   = COALESCE(EXCLUDED.photo_url, pf_users.photo_url),
+         referred_by = COALESCE(pf_users.referred_by, EXCLUDED.referred_by)
        RETURNING *`,
       [tgId, tgUser.username || null, tgUser.first_name || null, tgUser.photo_url || null,
        referrerId]
@@ -571,10 +634,15 @@ app.post('/api/auth', async (req, res) => {
     // Referral bonus (anti-bot, both tiers require 10 hands):
     // • Premium user  → referrer gets +3000 after referred plays 10 hands
     // • Regular user  → referrer gets +1000 after referred plays 10 hands
-    if (isNew && referrerId) {
+    // Also handles existing users who join via referral link for the first time
+    const referralJustSet = referrerId && (isNew || !hadReferral)
+    if (referralJustSet) {
       const isPremium = tgUser.is_premium === true
       const bonus = isPremium ? 3000 : 1000
-      await db.query(`UPDATE pf_users SET referral_bonus = $1 WHERE tg_id=$2`, [bonus, tgId]).catch(() => {})
+      await db.query(
+        `UPDATE pf_users SET referral_bonus = $1 WHERE tg_id=$2 AND (referral_bonus IS NULL OR referral_bonus = 0)`,
+        [bonus, tgId]
+      ).catch(() => {})
       // Credit handled in wsServer.ts saveHandStats() after 10 hands
     }
 

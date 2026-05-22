@@ -1,5 +1,5 @@
 import { WebSocket, WebSocketServer } from 'ws'
-import { GameState, createTable, addPlayer, removePlayer, startHand, applyAction, canStart, maskForPlayer, PlayerAction } from './engine/game'
+import { GameState, createTable, addPlayer, removePlayer, startHand, applyAction, advanceStreet, canStart, maskForPlayer, PlayerAction } from './engine/game'
 import { getPool, logTransaction } from './db'
 
 interface Client {
@@ -16,6 +16,7 @@ const startTimers = new Map<string, NodeJS.Timeout>()
 const actionTimers = new Map<string, NodeJS.Timeout>()
 const afkTimers = new Map<string, NodeJS.Timeout>()   // key: tableId:playerId
 const playerBanks = new Map<string, number>()          // key: tableId:playerId → chips left in bank (DB - buyIn)
+const runoutTables = new Set<string>()                 // tables currently in all-in board runout
 
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
   // NL Hold'em
@@ -38,6 +39,19 @@ const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; m
   weekly:   { sb: 100, bb: 200, minBuyIn: 5000 },
 }
 const ACTION_TIMEOUT_MS = 30_000
+
+// Safety watchdog: every 5s scan all tables for stuck all-in states
+setInterval(() => {
+  for (const [tableId, state] of tables) {
+    if (state.street === 'waiting' || state.street === 'showdown') continue
+    if (runoutTables.has(tableId)) continue
+    if (actionTimers.has(tableId)) continue  // normal action timer is running
+    if (canAutoRunBoard(state)) {
+      console.log(`[Watchdog] ${tableId}: stuck board at ${state.street}, triggering runout`)
+      runBoardToShowdown(tableId)
+    }
+  }
+}, 5000)
 
 export function setupWS(wss: WebSocketServer) {
   wss.on('connection', (ws) => {
@@ -83,17 +97,24 @@ function handleMessage(ws: WebSocket, msg: any) {
     broadcastTable(tableId)
 
     if (state.street === 'showdown' && prevStreet !== 'showdown') {
+      // Reached showdown via normal action (e.g. everyone folded on river)
       saveHandStats(state).catch(e => console.error('stats error:', e))
       setTimeout(() => {
         let s = tables.get(tableId)
         if (!s) return
         if (canStart(s)) { s = startHand(s); tables.set(tableId, s) }
-        else s.street = 'waiting'
+        else s.street = 'waiting' as any
         broadcastTable(tableId)
         setActionTimer(tableId)
       }, 4000)
     } else {
-      setActionTimer(tableId)
+      // Борд идёт автоматически: все в олл-ин, или оставшиеся игроки могут только чекнуть
+      if (canAutoRunBoard(state)) {
+        console.log(`[AutoRun] ${tableId}: starting at ${state.street}`)
+        runBoardToShowdown(tableId)
+      } else {
+        setActionTimer(tableId)
+      }
     }
     return
   }
@@ -328,24 +349,46 @@ function foldDisconnectedPlayers(tableId: string) {
 
 function setActionTimer(tableId: string) {
   clearActionTimer(tableId)
+
+  // Don't set a timer if a board runout is already in progress
+  if (runoutTables.has(tableId)) return
+
   let state = tables.get(tableId)
   if (state) {
-    const p = state.players[state.actionIdx]
+    // Автоматический ранаут: все в олл-ин или оставшиеся могут только чекнуть
+    if (canAutoRunBoard(state)) {
+      console.log(`[AutoRun] ${tableId}: setActionTimer triggered runout at ${state.street}`)
+      runBoardToShowdown(tableId)
+      return
+    }
     // Disconnected player at the wheel — fold them immediately (no 30s wait)
+    const p = state.players[state.actionIdx]
     if (p && !p.folded && !p.allIn && !p.connected) {
       const timer = setTimeout(() => foldDisconnectedPlayers(tableId), 800)
       actionTimers.set(tableId, timer)
       return
     }
   }
+
   const timer = setTimeout(() => {
     let state = tables.get(tableId)
     if (!state || state.street === 'waiting' || state.street === 'showdown') return
+
+    // Повторная проверка — возможно с момента старта таймера все ушли в олл-ин
+    if (canAutoRunBoard(state)) {
+      console.log(`[AutoRun] ${tableId}: timer fired, triggering runout at ${state.street}`)
+      runBoardToShowdown(tableId)
+      return
+    }
+
     const p = state.players[state.actionIdx]
     if (!p || p.folded || p.allIn) { setActionTimer(tableId); return }
+
+    // Auto-fold timed-out player
     state = applyAction(state, p.id, 'fold')
     tables.set(tableId, state)
     broadcastTable(tableId)
+
     if (state.street === 'showdown') {
       saveHandStats(state).catch(console.error)
       setTimeout(() => {
@@ -366,6 +409,90 @@ function setActionTimer(tableId: string) {
 function clearActionTimer(tableId: string) {
   const t = actionTimers.get(tableId)
   if (t) { clearTimeout(t); actionTimers.delete(tableId) }
+}
+
+// Returns true if the board should run automatically:
+// 1. All non-folded players are all-in, OR
+// 2. Remaining non-all-in players can ONLY check (toCall=0, all opponents are all-in)
+//    — i.e. no real betting decision is possible
+function canAutoRunBoard(state: GameState): boolean {
+  if (state.street === 'showdown' || state.street === 'waiting') return false
+  const activePlayers = state.players.filter(p => !p.folded && !p.allIn)
+  if (activePlayers.length === 0) return true  // everyone all-in
+  // Each active player can only check if: nothing to call AND no opponent that can bet back
+  return activePlayers.every(p => {
+    const toCall = Math.max(0, state.currentBet - p.bet)
+    if (toCall > 0) return false
+    const opponentCanBet = state.players.some(pp => !pp.folded && !pp.allIn && pp.id !== p.id)
+    return !opponentCanBet
+  })
+}
+
+// Run remaining board streets automatically (all-in runout OR check-only situation).
+// Uses async/await + mutex to prevent double execution and stale state bugs.
+function runBoardToShowdown(tableId: string): void {
+  if (runoutTables.has(tableId)) {
+    console.log(`[RunBoard] ${tableId}: already running, skip`)
+    return
+  }
+
+  const s = tables.get(tableId)
+  if (!s || !canAutoRunBoard(s)) {
+    if (s && !canAutoRunBoard(s)) setActionTimer(tableId)
+    return
+  }
+
+  runoutTables.add(tableId)
+  clearActionTimer(tableId)
+  console.log(`[RunBoard] ${tableId}: starting from ${s.street}`)
+
+  const CARD_DELAY = 1000  // 1s между улицами — как в реальных покер-румах
+
+  async function loop() {
+    try {
+      while (true) {
+        await new Promise<void>(res => setTimeout(res, CARD_DELAY))
+
+        let state = tables.get(tableId)
+        if (!state || state.street === 'showdown' || state.street === 'waiting') break
+
+        if (!canAutoRunBoard(state)) {
+          // Ситуация изменилась (например, ребай) — передаём управление таймеру
+          console.log(`[RunBoard] ${tableId}: player can now bet, stopping runout`)
+          setActionTimer(tableId)
+          return
+        }
+
+        // advanceStreet разбирает оба случая:
+        // • все в олл-ин → просто раскладывает карты
+        // • остался игрок с фишками, но все оппоненты в олл-ин → улица тоже завершена
+        state = advanceStreet(state)
+        tables.set(tableId, state)
+        broadcastTable(tableId)
+        console.log(`[RunBoard] ${tableId}: dealt ${state.street}`)
+
+        if (state.street === 'showdown') {
+          saveHandStats(state).catch(e => console.error('[RunBoard] stats error:', e))
+          await new Promise<void>(res => setTimeout(res, 4000))
+          let s2 = tables.get(tableId)
+          if (!s2) break
+          s2 = canStart(s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
+          tables.set(tableId, s2)
+          broadcastTable(tableId)
+          setActionTimer(tableId)
+          break
+        }
+      }
+    } finally {
+      runoutTables.delete(tableId)
+      console.log(`[RunBoard] ${tableId}: runout complete`)
+    }
+  }
+
+  loop().catch(e => {
+    runoutTables.delete(tableId)
+    console.error(`[RunBoard] ${tableId}: error`, e)
+  })
 }
 
 function broadcastTable(tableId: string) {

@@ -169,7 +169,7 @@ function isStreetOver(s: GameState): boolean {
   return active.every(p => p.hasActed && p.bet === s.currentBet)
 }
 
-function advanceStreet(s: GameState): GameState {
+export function advanceStreet(s: GameState): GameState {
   // Reset bets and acted flags for new street
   for (const p of s.players) { p.bet = 0; p.hasActed = false }
   s.currentBet = 0

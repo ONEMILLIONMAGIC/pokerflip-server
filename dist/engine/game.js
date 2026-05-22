@@ -4,6 +4,7 @@ exports.createTable = createTable;
 exports.canStart = canStart;
 exports.startHand = startHand;
 exports.applyAction = applyAction;
+exports.advanceStreet = advanceStreet;
 exports.addPlayer = addPlayer;
 exports.removePlayer = removePlayer;
 exports.maskForPlayer = maskForPlayer;
@@ -43,6 +44,7 @@ function startHand(state) {
         p.totalBet = 0;
         p.folded = p.chips === 0;
         p.allIn = false;
+        p.hasActed = false;
     }
     // Move dealer button (skip broke/disconnected)
     s.dealerIdx = nextActiveIdx(s, s.dealerIdx);
@@ -112,6 +114,7 @@ function applyAction(state, playerId, action, amount = 0) {
             break;
         }
     }
+    p.hasActed = true;
     s.lastActionTime = Date.now();
     // Check if street is over
     if (isStreetOver(s)) {
@@ -124,13 +127,15 @@ function isStreetOver(s) {
     const active = s.players.filter(p => !p.folded && !p.allIn);
     if (active.length === 0)
         return true;
-    // All active players have matched the current bet
-    return active.every(p => p.bet === s.currentBet || p.allIn);
+    // All active players have matched the current bet AND had a chance to act
+    return active.every(p => p.hasActed && p.bet === s.currentBet);
 }
 function advanceStreet(s) {
-    // Reset bets for new street
-    for (const p of s.players)
+    // Reset bets and acted flags for new street
+    for (const p of s.players) {
         p.bet = 0;
+        p.hasActed = false;
+    }
     s.currentBet = 0;
     s.minRaise = s.bigBlind;
     const notFolded = s.players.filter(p => !p.folded);
@@ -169,11 +174,41 @@ function resolveShowdown(s) {
         player: p,
         result: (0, handEval_1.evaluate)([...p.holeCards, ...s.board]),
     }));
+    // Log showdown details for debugging
+    const boardStr = s.board.map(c => `${c.rank}${c.suit}`).join(' ');
+    for (const r of results) {
+        const hole = r.player.holeCards.map(c => `${c.rank}${c.suit}`).join(' ');
+        console.log(`[Showdown] ${r.player.name}: hole=[${hole}] board=[${boardStr}] → ${r.result.name} (score=${r.result.score})`);
+    }
+    // Also log folded players so we can see if they had strong hands
+    for (const p of s.players.filter(p => p.folded && p.holeCards.length > 0)) {
+        const hole = p.holeCards.map(c => `${c.rank}${c.suit}`).join(' ');
+        const ev = (0, handEval_1.evaluate)([...p.holeCards, ...s.board]);
+        console.log(`[Showdown] ${p.name} (FOLDED): hole=[${hole}] board=[${boardStr}] → would have had ${ev.name} (score=${ev.score})`);
+    }
     results.sort((a, b) => (0, handEval_1.compareHands)(b.result, a.result));
-    const winner = results[0];
-    // Simple: winner takes all (no side pots for MVP)
-    winner.player.chips += s.pot;
-    s.winners = [{ playerId: winner.player.id, amount: s.pot, hand: winner.result.name }];
+    // Handle split pot (ties)
+    const topScore = results[0].result.score;
+    const winners = results.filter(r => r.result.score === topScore);
+    if (winners.length > 1) {
+        const share = Math.floor(s.pot / winners.length);
+        const remainder = s.pot - share * winners.length;
+        for (let i = 0; i < winners.length; i++) {
+            winners[i].player.chips += share + (i === 0 ? remainder : 0);
+        }
+        s.winners = winners.map((w, i) => ({
+            playerId: w.player.id,
+            amount: share + (i === 0 ? remainder : 0),
+            hand: w.result.name,
+        }));
+        console.log(`[Showdown] SPLIT POT: ${winners.map(w => w.player.name).join(' & ')} each get ${share}`);
+    }
+    else {
+        const winner = results[0];
+        winner.player.chips += s.pot;
+        s.winners = [{ playerId: winner.player.id, amount: s.pot, hand: winner.result.name }];
+        console.log(`[Showdown] WINNER: ${winner.player.name} with ${winner.result.name} (score=${winner.result.score})`);
+    }
     s.pot = 0;
     return s;
 }
@@ -198,7 +233,7 @@ function addPlayer(state, id, name, chips, seat) {
         existing.connected = true;
         return s;
     }
-    s.players.push({ id, name, chips, holeCards: [], bet: 0, totalBet: 0, folded: false, allIn: false, connected: true, seatIndex: seat });
+    s.players.push({ id, name, chips, holeCards: [], bet: 0, totalBet: 0, folded: false, allIn: false, connected: true, seatIndex: seat, hasActed: false });
     s.players.sort((a, b) => a.seatIndex - b.seatIndex);
     return s;
 }
@@ -212,8 +247,14 @@ function removePlayer(state, id) {
 // Mask hole cards for a specific viewer (hide opponent cards)
 function maskForPlayer(state, viewerId) {
     const s = deepClone(state);
+    // All-in players show cards if no more betting action is possible
+    const activeBettors = s.players.filter(p => !p.folded && !p.allIn);
+    const allInShowdown = activeBettors.length <= 1; // all remaining are all-in → show cards
     for (const p of s.players) {
         if (p.id !== viewerId && s.street !== 'showdown') {
+            // Keep cards visible if player is all-in and board is being run out
+            if (p.allIn && allInShowdown)
+                continue;
             p.holeCards = p.holeCards.map(() => ({ rank: '?', suit: '?' }));
         }
     }
