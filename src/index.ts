@@ -136,7 +136,7 @@ app.post('/api/webhook', async (req, res) => {
         const lines = rows.map((r: any) => `*${r.tournament_id}*: ${r.status} | ${regMap[r.tournament_id] || 0} registered`)
         await tgSend(chatId, `📊 *Tournament Status*\n\n${lines.join('\n')}`)
       } else if (text === '/admin spin') {
-        await db.query(`UPDATE pf_users SET last_spin_at = NULL, can_spin = true WHERE tg_id=$1`, [String(chatId)])
+        await db.query(`UPDATE pf_users SET last_spin_at = NULL WHERE tg_id=$1`, [String(chatId)])
         await tgSend(chatId, `✅ Daily spin reset. Open the app to spin!`, { reply_markup: PLAY_BTN })
       } else if (text === '/admin') {
         await tgSend(chatId,
