@@ -135,13 +135,17 @@ app.post('/api/webhook', async (req, res) => {
         reg.forEach((r: any) => { regMap[r.tournament_id] = Number(r.cnt) })
         const lines = rows.map((r: any) => `*${r.tournament_id}*: ${r.status} | ${regMap[r.tournament_id] || 0} registered`)
         await tgSend(chatId, `📊 *Tournament Status*\n\n${lines.join('\n')}`)
+      } else if (text === '/admin spin') {
+        await db.query(`UPDATE pf_users SET last_spin_at = NULL, can_spin = true WHERE tg_id=$1`, [String(chatId)])
+        await tgSend(chatId, `✅ Daily spin reset. Open the app to spin!`, { reply_markup: PLAY_BTN })
       } else if (text === '/admin') {
         await tgSend(chatId,
           `🔧 *Admin Commands*\n\n` +
           `/admin start daily — force start Daily tournament\n` +
           `/admin start weekly — force start Weekly tournament\n` +
           `/admin end daily — reset tournament to pending\n` +
-          `/admin stats — tournament & registration status`)
+          `/admin stats — tournament & registration status\n` +
+          `/admin spin — reset daily spin for yourself`)
       }
     }
 
@@ -271,6 +275,52 @@ async function checkTournamentReset() {
   `).catch(() => {})
 }
 
+// Refund and clean up registrations that belong to a past cycle (tournament never started)
+async function checkStaleRegistrations() {
+  const db = getPool()
+  for (const id of Object.keys(TOURNAMENT_CONFIGS)) {
+    const cfg = TOURNAMENT_CONFIGS[id]
+    const current = cycleKey(id)
+
+    // Don't touch registrations while tournament is active
+    const { rows: st } = await db.query(
+      `SELECT status FROM pf_tournament_status WHERE tournament_id=$1`, [id]
+    ).catch(() => ({ rows: [] as any[] }))
+    if (st[0]?.status === 'active') continue
+
+    // Find stale registrations: wrong cycle_key OR old regs without cycle_key (>25h old)
+    const { rows: stale } = await db.query(
+      `SELECT tg_id FROM pf_tournament_regs
+       WHERE tournament_id=$1 AND (
+         (cycle_key != '' AND cycle_key != $2) OR
+         (cycle_key = '' AND registered_at < NOW() - INTERVAL '25 hours')
+       )`,
+      [id, current]
+    ).catch(() => ({ rows: [] as any[] }))
+
+    if (stale.length === 0) continue
+
+    for (const r of stale) {
+      await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2', [cfg.buyIn, r.tg_id]).catch(() => {})
+      await logTransaction(r.tg_id, 'tournament_refund', cfg.buyIn,
+        `Refund: ${id} tournament cancelled (+${cfg.buyIn.toLocaleString()} chips)`).catch(() => {})
+      tgSend(r.tg_id,
+        `♠️ *Tournament Refund*\n\nThe *${id === 'daily' ? 'Daily Grind' : 'Weekly Chill'}* tournament didn't start (not enough players).\n\nYour buy-in of *${cfg.buyIn.toLocaleString()} chips* has been refunded. ✅`
+      ).catch(() => {})
+    }
+
+    await db.query(
+      `DELETE FROM pf_tournament_regs WHERE tournament_id=$1 AND (
+        (cycle_key != '' AND cycle_key != $2) OR
+        (cycle_key = '' AND registered_at < NOW() - INTERVAL '25 hours')
+      )`,
+      [id, current]
+    ).catch(() => {})
+
+    console.log(`Refunded ${stale.length} stale registrations for ${id}`)
+  }
+}
+
 function nextOccurrence(hour: number, minute = 0, weekday?: number) {
   const now = new Date()
   const d = new Date(now)
@@ -369,9 +419,10 @@ app.post('/api/tournaments/register', async (req, res) => {
       return res.status(400).json({ error: 'insufficient_chips', required: cfg.buyIn, have: userRows[0].chips })
     }
 
+    const currentCycle = cycleKey(tournamentId)
     const { rowCount } = await db.query(
-      `INSERT INTO pf_tournament_regs (tg_id, tournament_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-      [tgId, tournamentId]
+      `INSERT INTO pf_tournament_regs (tg_id, tournament_id, cycle_key) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+      [tgId, tournamentId, currentCycle]
     )
     if (rowCount && rowCount > 0) {
       await db.query('UPDATE pf_users SET chips = chips - $1 WHERE tg_id=$2', [cfg.buyIn, tgId])
@@ -993,3 +1044,5 @@ server.listen(PORT, () => console.log(`\n♠️ PokerFlip server → http://loca
 initDB().catch(e => console.error('DB init warning:', e))
 setInterval(checkTournamentAutoStart, 60_000)
 setInterval(checkTournamentReset, 5 * 60_000)
+setInterval(checkStaleRegistrations, 5 * 60_000)
+checkStaleRegistrations() // run once on startup to clean old regs
