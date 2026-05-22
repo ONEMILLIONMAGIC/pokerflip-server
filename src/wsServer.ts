@@ -141,13 +141,16 @@ function handleMessage(ws: WebSocket, msg: any) {
     const cfg = TABLE_CONFIG[tableId] || TABLE_CONFIG.main
 
     if (!amount || amount <= 0) return send(ws, { type: 'error', code: 'rebuy_failed', message: 'Invalid amount' })
-    if (amount > bank) return send(ws, { type: 'error', code: 'insufficient_chips', required: amount, have: bank })
-    if (amount < cfg.minBuyIn) return send(ws, { type: 'error', code: 'rebuy_failed', message: `Min rebuy: ${cfg.minBuyIn}` })
 
     let state = tables.get(tableId)
     if (!state) return
     const playerInState = state.players.find(p => p.id === playerId)
     if (!playerInState) return
+
+    const maxBuyIn = cfg.bb * 200
+    const maxAllowed = Math.min(bank, maxBuyIn - playerInState.chips)
+    if (amount > maxAllowed) return send(ws, { type: 'error', code: 'rebuy_failed', message: `Max rebuy: ${maxAllowed}` })
+    if (amount < cfg.minBuyIn && maxAllowed >= cfg.minBuyIn) return send(ws, { type: 'error', code: 'rebuy_failed', message: `Min rebuy: ${cfg.minBuyIn}` })
 
     // Move amount from bank → table chips
     const newBank = bank - amount
