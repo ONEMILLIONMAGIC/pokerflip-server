@@ -141,6 +141,36 @@ export async function registerForSF(
   return { sessionId, playerCount: 3, prize, tableId, status: 'session_started' }
 }
 
+export async function cancelSFRegistration(tgId: string, roomId: SFRoomId) {
+  const db = getPool()
+  const cfg = SF_CONFIGS[roomId]
+
+  // Only cancel if session is still 'waiting' (not started)
+  const { rows } = await db.query(
+    `SELECT sr.session_id FROM pf_sf_registrations sr
+     JOIN pf_sf_sessions ss ON ss.id = sr.session_id
+     WHERE sr.tg_id = $1 AND ss.room_id = $2 AND ss.status = 'waiting'`,
+    [tgId, roomId]
+  )
+  if (!rows[0]) throw new Error('No cancellable registration (game may have already started)')
+
+  const sessionId = rows[0].session_id
+
+  await db.query('DELETE FROM pf_sf_registrations WHERE session_id = $1 AND tg_id = $2', [sessionId, tgId])
+  await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id = $2', [cfg.buyIn, tgId])
+  await logTransaction(tgId, 'sf_cancel', cfg.buyIn, `Cancelled Spin & Flip entry: ${cfg.name}`)
+
+  // Remove empty session
+  const { rows: cnt } = await db.query(
+    'SELECT COUNT(*)::int AS cnt FROM pf_sf_registrations WHERE session_id = $1', [sessionId]
+  )
+  if (Number(cnt[0].cnt) === 0) {
+    await db.query('DELETE FROM pf_sf_sessions WHERE id = $1 AND status = $2', [sessionId, 'waiting'])
+  }
+
+  return { refunded: cfg.buyIn }
+}
+
 export async function getSFStatus(tgId?: string) {
   const db = getPool()
   const result: Record<string, any> = {}
