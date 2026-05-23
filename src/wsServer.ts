@@ -25,6 +25,9 @@ const sfBlinds = new Map<string, { level: number; sb: number; bb: number; nextAt
 // SF sessions that have already ended — guard against double-completion and stale hand starts
 const sfEndedTables = new Set<string>()
 
+// Connected players in AFK mode (timed out) — auto-fold quickly on next turn
+const afkMode = new Set<string>()  // key: tableId:playerId
+
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
   // NL Hold'em
   main:     { sb: 10,  bb: 20,  minBuyIn: 400 },
@@ -100,7 +103,15 @@ function handleMessage(ws: WebSocket, msg: any) {
   if (!client) return send(ws, { type: 'error', message: 'Not joined' })
   const { playerId, tableId } = client
 
+  if (type === 'here') {
+    afkMode.delete(`${tableId}:${playerId}`)
+    send(ws, { type: 'here_ok' })
+    return
+  }
+
   if (type === 'action') {
+    // Any explicit action clears AFK mode
+    afkMode.delete(`${tableId}:${playerId}`)
     const { action, amount } = msg as { action: PlayerAction; amount?: number }
     let state = tables.get(tableId)
     if (!state) return
@@ -243,7 +254,10 @@ function handleDisconnect(ws: WebSocket) {
     }
   }
 
-  // Mark as AFK/disconnected (not removed yet — give 30s to reconnect)
+  // Clear AFK mode flag
+  afkMode.delete(`${tableId}:${playerId}`)
+
+  // Mark as disconnected (stays in player list)
   state = removePlayer(state, playerId)
   tables.set(tableId, state)
   broadcastTable(tableId)
@@ -253,7 +267,13 @@ function handleDisconnect(ws: WebSocket) {
     setTimeout(() => resolveHandAfterDisconnect(tableId), 600)
   }
 
-  // After 30s without reconnect — actually remove the player slot
+  // SF: player stays seated as AFK — never auto-removed (they paid buy-in, must play out)
+  if (getSFRoomId(tableId)) {
+    console.log(`SF player ${playerId} disconnected — staying seated AFK at ${tableId}`)
+    return
+  }
+
+  // Cash/tournament: remove player slot after 30s without reconnect
   const afkKey = `${tableId}:${playerId}`
   const existingAfk = afkTimers.get(afkKey)
   if (existingAfk) clearTimeout(existingAfk)
@@ -411,13 +431,36 @@ function setActionTimer(tableId: string) {
       actionTimers.set(tableId, timer)
       return
     }
+    // AFK mode: connected player already timed out once — quick-fold without waiting 30s
+    if (p && !p.folded && !p.allIn && p.connected && afkMode.has(`${tableId}:${p.id}`)) {
+      const timer = setTimeout(() => {
+        let st = tables.get(tableId)
+        if (!st || st.street === 'waiting' || st.street === 'showdown') return
+        if (canAutoRunBoard(st)) { runBoardToShowdown(tableId); return }
+        const pp = st.players[st.actionIdx]
+        if (!pp || pp.folded || pp.allIn) { setActionTimer(tableId); return }
+        st = applyAction(st, pp.id, 'fold')
+        tables.set(tableId, st)
+        broadcastTable(tableId)
+        if (st.street === 'showdown') {
+          saveHandStats(st).catch(console.error)
+          setTimeout(() => {
+            let s = tables.get(tableId)
+            if (!s) return
+            s = canStartTable(tableId, s) ? startHand(s) : { ...s, street: 'waiting' as any }
+            tables.set(tableId, s); broadcastTable(tableId); setActionTimer(tableId)
+          }, 4000)
+        } else { setActionTimer(tableId) }
+      }, 800)
+      actionTimers.set(tableId, timer)
+      return
+    }
   }
 
   const timer = setTimeout(() => {
     let state = tables.get(tableId)
     if (!state || state.street === 'waiting' || state.street === 'showdown') return
 
-    // Повторная проверка — возможно с момента старта таймера все ушли в олл-ин
     if (canAutoRunBoard(state)) {
       console.log(`[AutoRun] ${tableId}: timer fired, triggering runout at ${state.street}`)
       runBoardToShowdown(tableId)
@@ -427,17 +470,27 @@ function setActionTimer(tableId: string) {
     const p = state.players[state.actionIdx]
     if (!p || p.folded || p.allIn) { setActionTimer(tableId); return }
 
-    // Auto-fold timed-out player
+    // Auto-fold timed-out player + enter AFK mode
     state = applyAction(state, p.id, 'fold')
     tables.set(tableId, state)
     broadcastTable(tableId)
+
+    // Mark as AFK — next turn will be instant-fold
+    const afkKey = `${tableId}:${p.id}`
+    afkMode.add(afkKey)
+    // Notify the player
+    for (const [ws2, c2] of clients) {
+      if (c2.tableId === tableId && c2.playerId === p.id && ws2.readyState === WebSocket.OPEN) {
+        send(ws2, { type: 'you_are_afk' })
+      }
+    }
 
     if (state.street === 'showdown') {
       saveHandStats(state).catch(console.error)
       setTimeout(() => {
         let s = tables.get(tableId)
         if (!s) return
-        s = canStart(s) ? startHand(s) : { ...s, street: 'waiting' as any }
+        s = canStartTable(tableId, s) ? startHand(s) : { ...s, street: 'waiting' as any }
         tables.set(tableId, s)
         broadcastTable(tableId)
         setActionTimer(tableId)
@@ -677,6 +730,7 @@ async function handleJoin(ws: WebSocket, msg: any) {
   // Handle reconnection — player already at this table but disconnected
   const reconnectingPlayer = state.players.find(p => p.id === playerId && !p.connected)
   if (reconnectingPlayer) {
+    afkMode.delete(afkKey)
     state = addPlayer(state, playerId, playerName, reconnectingPlayer.chips, reconnectingPlayer.seatIndex)
     tables.set(tableId, state)
     clients.set(ws, { ws, playerId, playerName, tableId })
@@ -791,6 +845,9 @@ async function checkSFEnd(state: GameState) {
     if (st) { clearTimeout(st); startTimers.delete(tableId) }
     for (const key of [...playerBanks.keys()]) {
       if (key.startsWith(`${tableId}:`)) playerBanks.delete(key)
+    }
+    for (const key of [...afkMode]) {
+      if (key.startsWith(`${tableId}:`)) afkMode.delete(key)
     }
     runoutTables.delete(tableId)
     console.log(`SF table ${tableId} resources cleaned up`)

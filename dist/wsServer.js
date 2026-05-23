@@ -17,6 +17,8 @@ const runoutTables = new Set(); // tables currently in all-in board runout
 const sfBlinds = new Map();
 // SF sessions that have already ended — guard against double-completion and stale hand starts
 const sfEndedTables = new Set();
+// Connected players in AFK mode (timed out) — auto-fold quickly on next turn
+const afkMode = new Set(); // key: tableId:playerId
 const TABLE_CONFIG = {
     // NL Hold'em
     main: { sb: 10, bb: 20, minBuyIn: 400 },
@@ -38,6 +40,12 @@ const TABLE_CONFIG = {
     weekly: { sb: 100, bb: 200, minBuyIn: 5000 },
 };
 const ACTION_TIMEOUT_MS = 30000;
+// SF blind status broadcast: every 5s push current level + time-to-next to all SF tables
+setInterval(() => {
+    for (const [tableId, bs] of sfBlinds) {
+        broadcastToTable(tableId, { type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb, nextLevelAt: bs.nextAt });
+    }
+}, 5000);
 // Safety watchdog: every 5s scan all tables for stuck all-in states
 setInterval(() => {
     for (const [tableId, state] of tables) {
@@ -82,7 +90,14 @@ function handleMessage(ws, msg) {
     if (!client)
         return send(ws, { type: 'error', message: 'Not joined' });
     const { playerId, tableId } = client;
+    if (type === 'here') {
+        afkMode.delete(`${tableId}:${playerId}`);
+        send(ws, { type: 'here_ok' });
+        return;
+    }
     if (type === 'action') {
+        // Any explicit action clears AFK mode
+        afkMode.delete(`${tableId}:${playerId}`);
         const { action, amount } = msg;
         let state = tables.get(tableId);
         if (!state)
@@ -99,7 +114,7 @@ function handleMessage(ws, msg) {
                 let s = tables.get(tableId);
                 if (!s)
                     return;
-                if ((0, game_1.canStart)(s)) {
+                if (canStartTable(tableId, s)) {
                     s = (0, game_1.startHand)(s);
                     tables.set(tableId, s);
                 }
@@ -123,7 +138,7 @@ function handleMessage(ws, msg) {
     }
     if (type === 'start') {
         let state = tables.get(tableId);
-        if (!state || !(0, game_1.canStart)(state))
+        if (!state || !canStartTable(tableId, state))
             return send(ws, { type: 'error', message: 'Need 2+ players' });
         state = (0, game_1.startHand)(state);
         tables.set(tableId, state);
@@ -226,7 +241,9 @@ function handleDisconnect(ws) {
             }
         }
     }
-    // Mark as AFK/disconnected (not removed yet — give 30s to reconnect)
+    // Clear AFK mode flag
+    afkMode.delete(`${tableId}:${playerId}`);
+    // Mark as disconnected (stays in player list)
     state = (0, game_1.removePlayer)(state, playerId);
     tables.set(tableId, state);
     broadcastTable(tableId);
@@ -234,7 +251,12 @@ function handleDisconnect(ws) {
     if (inActiveHand) {
         setTimeout(() => resolveHandAfterDisconnect(tableId), 600);
     }
-    // After 30s without reconnect — actually remove the player slot
+    // SF: player stays seated as AFK — never auto-removed (they paid buy-in, must play out)
+    if ((0, spinFlip_1.getSFRoomId)(tableId)) {
+        console.log(`SF player ${playerId} disconnected — staying seated AFK at ${tableId}`);
+        return;
+    }
+    // Cash/tournament: remove player slot after 30s without reconnect
     const afkKey = `${tableId}:${playerId}`;
     const existingAfk = afkTimers.get(afkKey);
     if (existingAfk)
@@ -266,7 +288,7 @@ function scheduleStart(tableId) {
         if (sfEndedTables.has(tableId))
             return; // check again inside timer
         let state = tables.get(tableId);
-        if (!state || !(0, game_1.canStart)(state) || state.street !== 'waiting')
+        if (!state || !canStartTable(tableId, state) || state.street !== 'waiting')
             return;
         // SF: init blind tracker on first hand, then double blinds every 3 min
         if (tableId.startsWith('sf_')) {
@@ -284,6 +306,8 @@ function scheduleStart(tableId) {
                 tables.set(tableId, state);
                 broadcastToTable(tableId, { type: 'blind_increase', level: bs.level, sb: bs.sb, bb: bs.bb });
             }
+            // Broadcast current blind status to all players at table
+            broadcastToTable(tableId, { type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb, nextLevelAt: bs.nextAt });
         }
         state = (0, game_1.startHand)(state);
         tables.set(tableId, state);
@@ -323,7 +347,7 @@ function resolveHandAfterDisconnect(tableId) {
                 let s2 = tables.get(tableId);
                 if (!s2)
                     return;
-                s2 = (0, game_1.canStart)(s2) ? (0, game_1.startHand)(s2) : { ...s2, street: 'waiting' };
+                s2 = canStartTable(tableId, s2) ? (0, game_1.startHand)(s2) : { ...s2, street: 'waiting' };
                 tables.set(tableId, s2);
                 broadcastTable(tableId);
             }, 2000);
@@ -354,7 +378,7 @@ function foldDisconnectedPlayers(tableId) {
             let s2 = tables.get(tableId);
             if (!s2)
                 return;
-            s2 = (0, game_1.canStart)(s2) ? (0, game_1.startHand)(s2) : { ...s2, street: 'waiting' };
+            s2 = canStartTable(tableId, s2) ? (0, game_1.startHand)(s2) : { ...s2, street: 'waiting' };
             tables.set(tableId, s2);
             broadcastTable(tableId);
             setActionTimer(tableId);
@@ -386,12 +410,48 @@ function setActionTimer(tableId) {
             actionTimers.set(tableId, timer);
             return;
         }
+        // AFK mode: connected player already timed out once — quick-fold without waiting 30s
+        if (p && !p.folded && !p.allIn && p.connected && afkMode.has(`${tableId}:${p.id}`)) {
+            const timer = setTimeout(() => {
+                let st = tables.get(tableId);
+                if (!st || st.street === 'waiting' || st.street === 'showdown')
+                    return;
+                if (canAutoRunBoard(st)) {
+                    runBoardToShowdown(tableId);
+                    return;
+                }
+                const pp = st.players[st.actionIdx];
+                if (!pp || pp.folded || pp.allIn) {
+                    setActionTimer(tableId);
+                    return;
+                }
+                st = (0, game_1.applyAction)(st, pp.id, 'fold');
+                tables.set(tableId, st);
+                broadcastTable(tableId);
+                if (st.street === 'showdown') {
+                    saveHandStats(st).catch(console.error);
+                    setTimeout(() => {
+                        let s = tables.get(tableId);
+                        if (!s)
+                            return;
+                        s = canStartTable(tableId, s) ? (0, game_1.startHand)(s) : { ...s, street: 'waiting' };
+                        tables.set(tableId, s);
+                        broadcastTable(tableId);
+                        setActionTimer(tableId);
+                    }, 4000);
+                }
+                else {
+                    setActionTimer(tableId);
+                }
+            }, 800);
+            actionTimers.set(tableId, timer);
+            return;
+        }
     }
     const timer = setTimeout(() => {
         let state = tables.get(tableId);
         if (!state || state.street === 'waiting' || state.street === 'showdown')
             return;
-        // Повторная проверка — возможно с момента старта таймера все ушли в олл-ин
         if (canAutoRunBoard(state)) {
             console.log(`[AutoRun] ${tableId}: timer fired, triggering runout at ${state.street}`);
             runBoardToShowdown(tableId);
@@ -402,17 +462,26 @@ function setActionTimer(tableId) {
             setActionTimer(tableId);
             return;
         }
-        // Auto-fold timed-out player
+        // Auto-fold timed-out player + enter AFK mode
         state = (0, game_1.applyAction)(state, p.id, 'fold');
         tables.set(tableId, state);
         broadcastTable(tableId);
+        // Mark as AFK — next turn will be instant-fold
+        const afkKey = `${tableId}:${p.id}`;
+        afkMode.add(afkKey);
+        // Notify the player
+        for (const [ws2, c2] of clients) {
+            if (c2.tableId === tableId && c2.playerId === p.id && ws2.readyState === ws_1.WebSocket.OPEN) {
+                send(ws2, { type: 'you_are_afk' });
+            }
+        }
         if (state.street === 'showdown') {
             saveHandStats(state).catch(console.error);
             setTimeout(() => {
                 let s = tables.get(tableId);
                 if (!s)
                     return;
-                s = (0, game_1.canStart)(s) ? (0, game_1.startHand)(s) : { ...s, street: 'waiting' };
+                s = canStartTable(tableId, s) ? (0, game_1.startHand)(s) : { ...s, street: 'waiting' };
                 tables.set(tableId, s);
                 broadcastTable(tableId);
                 setActionTimer(tableId);
@@ -493,7 +562,7 @@ function runBoardToShowdown(tableId) {
                     let s2 = tables.get(tableId);
                     if (!s2)
                         break;
-                    s2 = (0, game_1.canStart)(s2) ? (0, game_1.startHand)(s2) : { ...s2, street: 'waiting' };
+                    s2 = canStartTable(tableId, s2) ? (0, game_1.startHand)(s2) : { ...s2, street: 'waiting' };
                     tables.set(tableId, s2);
                     broadcastTable(tableId);
                     setActionTimer(tableId);
@@ -550,6 +619,12 @@ function getTableStats() {
 const TOURNAMENT_TABLE_IDS = new Set(['daily', 'weekly']);
 function getTableConfig(tableId) {
     return TABLE_CONFIG[tableId] || (0, spinFlip_1.getSFTableConfig)(tableId) || TABLE_CONFIG.main;
+}
+// SF tables: count all players with chips (AFK included). Cash tables: require connected.
+function canStartTable(tableId, state) {
+    if ((0, spinFlip_1.getSFRoomId)(tableId))
+        return state.players.filter(p => p.chips > 0).length >= 2;
+    return (0, game_1.canStart)(state);
 }
 async function handleJoin(ws, msg) {
     const { tableId = 'main', playerId, playerName, buyIn: requestedBuyIn } = msg;
@@ -645,6 +720,7 @@ async function handleJoin(ws, msg) {
     // Handle reconnection — player already at this table but disconnected
     const reconnectingPlayer = state.players.find(p => p.id === playerId && !p.connected);
     if (reconnectingPlayer) {
+        afkMode.delete(afkKey);
         state = (0, game_1.addPlayer)(state, playerId, playerName, reconnectingPlayer.chips, reconnectingPlayer.seatIndex);
         tables.set(tableId, state);
         clients.set(ws, { ws, playerId, playerName, tableId });
@@ -672,16 +748,38 @@ async function handleJoin(ws, msg) {
             .catch(e => console.error('Failed to deduct buy-in:', e));
         (0, db_1.logTransaction)(playerId, 'table_join', -playerChips, `Buy-in at ${tableId} (${playerChips.toLocaleString()} chips)`);
     }
-    // On SF join: broadcast prize so clients can show the wheel
+    // SF: pre-seed other registered players as AFK so game starts even if they haven't opened WS
     if (isSFTable && process.env.DATABASE_URL) {
         const sessionId = tableId.match(/_(\d+)$/)?.[1];
         if (sessionId) {
             const db = (0, db_1.getPool)();
-            db.query(`SELECT prize FROM pf_sf_sessions WHERE id=$1`, [sessionId])
-                .then(r => {
-                if (r.rows[0])
-                    send(ws, { type: 'sf_prize', prize: r.rows[0].prize, sessionId: Number(sessionId) });
-            }).catch(() => { });
+            // Fetch prize + seed AFK players in parallel
+            const [prizeRes, regRes] = await Promise.all([
+                db.query(`SELECT prize FROM pf_sf_sessions WHERE id=$1`, [sessionId]),
+                db.query(`SELECT r.tg_id, COALESCE(u.first_name, 'Player') AS name
+           FROM pf_sf_registrations r LEFT JOIN pf_users u ON u.tg_id = r.tg_id
+           WHERE r.session_id = $1`, [sessionId]),
+            ]).catch(() => [null, null]);
+            if (prizeRes?.rows[0]) {
+                send(ws, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) });
+            }
+            if (regRes?.rows) {
+                let st = tables.get(tableId);
+                for (const reg of regRes.rows) {
+                    if (reg.tg_id === playerId)
+                        continue; // already seated above
+                    if (st.players.find((p) => p.id === reg.tg_id))
+                        continue; // already in table
+                    const takenS = st.players.map((p) => p.seatIndex);
+                    const freeSeat = Array.from({ length: maxPlayers }, (_, i) => i).find(s => !takenS.includes(s)) ?? 0;
+                    st = (0, game_1.addPlayer)(st, reg.tg_id, reg.name, config.minBuyIn, freeSeat);
+                    // Mark as AFK (not connected via WS yet)
+                    const afkP = st.players.find((p) => p.id === reg.tg_id);
+                    if (afkP)
+                        afkP.connected = false;
+                }
+                tables.set(tableId, st);
+            }
         }
     }
     broadcastTable(tableId);
@@ -731,6 +829,10 @@ async function checkSFEnd(state) {
         for (const key of [...playerBanks.keys()]) {
             if (key.startsWith(`${tableId}:`))
                 playerBanks.delete(key);
+        }
+        for (const key of [...afkMode]) {
+            if (key.startsWith(`${tableId}:`))
+                afkMode.delete(key);
         }
         runoutTables.delete(tableId);
         console.log(`SF table ${tableId} resources cleaned up`);

@@ -223,6 +223,31 @@ app.post('/api/webhook', async (req, res) => {
                     }
                 }
             }
+            else if (text === '/admin sf clean') {
+                // Refund all players in waiting/ready SF sessions, then delete sessions
+                const { rows: regs } = await db.query(`
+          SELECT r.tg_id, s.room_id, s.id AS session_id
+          FROM pf_sf_registrations r
+          JOIN pf_sf_sessions s ON s.id = r.session_id
+          WHERE s.status IN ('waiting','ready')
+        `);
+                let refunded = 0;
+                for (const reg of regs) {
+                    const cfg = spinFlip_1.SF_CONFIGS[reg.room_id];
+                    if (!cfg)
+                        continue;
+                    await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2', [cfg.buyIn, reg.tg_id]);
+                    await (0, db_1.logTransaction)(reg.tg_id, 'sf_cancel', cfg.buyIn, `Admin SF cleanup refund: ${cfg.name}`);
+                    refunded++;
+                }
+                await db.query(`
+          DELETE FROM pf_sf_registrations WHERE session_id IN (
+            SELECT id FROM pf_sf_sessions WHERE status IN ('waiting','ready')
+          )
+        `);
+                await db.query(`DELETE FROM pf_sf_sessions WHERE status IN ('waiting','ready')`);
+                await tgSend(chatId, `✅ SF cleaned: refunded *${refunded}* players, all waiting/ready sessions deleted`);
+            }
             else if (text === '/admin') {
                 await tgSend(chatId, `🔧 *Admin Commands*\n\n` +
                     `/admin start daily — force start Daily tournament\n` +
@@ -232,7 +257,8 @@ app.post('/api/webhook', async (req, res) => {
                     `/admin spin — reset daily spin for yourself\n` +
                     `/admin lookup <name> — find user by name/username\n` +
                     `/admin referral <user_id> <referrer_id> — manually set referral\n` +
-                    `/admin credit <tgId> <amount> [reason] — credit chips`);
+                    `/admin credit <tgId> <amount> [reason] — credit chips\n` +
+                    `/admin sf clean — refund all SF registrations & clear stale sessions`);
             }
         }
     }

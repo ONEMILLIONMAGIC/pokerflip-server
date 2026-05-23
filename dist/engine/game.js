@@ -168,47 +168,76 @@ function advanceStreet(s) {
     s.actionIdx = nextActiveIdx(s, s.dealerIdx);
     return s;
 }
-function resolveShowdown(s) {
-    const contenders = s.players.filter(p => !p.folded);
-    const results = contenders.map(p => ({
-        player: p,
-        result: (0, handEval_1.evaluate)([...p.holeCards, ...s.board]),
-    }));
-    // Log showdown details for debugging
-    const boardStr = s.board.map(c => `${c.rank}${c.suit}`).join(' ');
-    for (const r of results) {
-        const hole = r.player.holeCards.map(c => `${c.rank}${c.suit}`).join(' ');
-        console.log(`[Showdown] ${r.player.name}: hole=[${hole}] board=[${boardStr}] → ${r.result.name} (score=${r.result.score})`);
+// Build side pots from players' total bets (including folded contributors)
+function calculatePots(players) {
+    const contributors = players.filter(p => p.totalBet > 0);
+    if (contributors.length === 0)
+        return [];
+    const levels = [...new Set(contributors.map(p => p.totalBet))].sort((a, b) => a - b);
+    const pots = [];
+    let prev = 0;
+    for (const level of levels) {
+        const contribution = level - prev;
+        const numContributors = contributors.filter(p => p.totalBet >= level).length;
+        const potAmount = contribution * numContributors;
+        const eligible = players.filter(p => !p.folded && p.totalBet >= level).map(p => p.id);
+        if (potAmount > 0)
+            pots.push({ amount: potAmount, eligible });
+        prev = level;
     }
-    // Also log folded players so we can see if they had strong hands
+    return pots;
+}
+function resolveShowdown(s) {
+    const boardStr = s.board.map(c => `${c.rank}${c.suit}`).join(' ');
+    for (const p of s.players.filter(p => !p.folded)) {
+        const hole = p.holeCards.map(c => `${c.rank}${c.suit}`).join(' ');
+        const r = (0, handEval_1.evaluate)([...p.holeCards, ...s.board]);
+        console.log(`[Showdown] ${p.name}: hole=[${hole}] board=[${boardStr}] → ${r.name} (score=${r.score})`);
+    }
     for (const p of s.players.filter(p => p.folded && p.holeCards.length > 0)) {
         const hole = p.holeCards.map(c => `${c.rank}${c.suit}`).join(' ');
         const ev = (0, handEval_1.evaluate)([...p.holeCards, ...s.board]);
         console.log(`[Showdown] ${p.name} (FOLDED): hole=[${hole}] board=[${boardStr}] → would have had ${ev.name} (score=${ev.score})`);
     }
-    results.sort((a, b) => (0, handEval_1.compareHands)(b.result, a.result));
-    // Handle split pot (ties)
-    const topScore = results[0].result.score;
-    const winners = results.filter(r => r.result.score === topScore);
-    if (winners.length > 1) {
-        const share = Math.floor(s.pot / winners.length);
-        const remainder = s.pot - share * winners.length;
-        for (let i = 0; i < winners.length; i++) {
-            winners[i].player.chips += share + (i === 0 ? remainder : 0);
+    const pots = calculatePots(s.players);
+    const winnerMap = new Map();
+    for (const pot of pots) {
+        const eligible = s.players.filter(p => pot.eligible.includes(p.id));
+        if (eligible.length === 0)
+            continue;
+        if (eligible.length === 1) {
+            eligible[0].chips += pot.amount;
+            const e = winnerMap.get(eligible[0].id);
+            if (e)
+                e.amount += pot.amount;
+            else
+                winnerMap.set(eligible[0].id, { amount: pot.amount, hand: 'Last standing' });
+            continue;
         }
-        s.winners = winners.map((w, i) => ({
-            playerId: w.player.id,
-            amount: share + (i === 0 ? remainder : 0),
-            hand: w.result.name,
-        }));
-        console.log(`[Showdown] SPLIT POT: ${winners.map(w => w.player.name).join(' & ')} each get ${share}`);
+        const results = eligible
+            .map(p => ({ player: p, result: (0, handEval_1.evaluate)([...p.holeCards, ...s.board]) }))
+            .sort((a, b) => (0, handEval_1.compareHands)(b.result, a.result));
+        const topScore = results[0].result.score;
+        const potWinners = results.filter(r => r.result.score === topScore);
+        const share = Math.floor(pot.amount / potWinners.length);
+        const remainder = pot.amount - share * potWinners.length;
+        if (potWinners.length > 1) {
+            console.log(`[Showdown] SPLIT ${pot.amount}: ${potWinners.map(w => w.player.name).join(' & ')} each ${share}`);
+        }
+        else {
+            console.log(`[Showdown] WIN: ${potWinners[0].player.name} takes ${pot.amount} with ${potWinners[0].result.name}`);
+        }
+        for (let i = 0; i < potWinners.length; i++) {
+            const amount = share + (i === 0 ? remainder : 0);
+            potWinners[i].player.chips += amount;
+            const e = winnerMap.get(potWinners[i].player.id);
+            if (e)
+                e.amount += amount;
+            else
+                winnerMap.set(potWinners[i].player.id, { amount, hand: potWinners[i].result.name });
+        }
     }
-    else {
-        const winner = results[0];
-        winner.player.chips += s.pot;
-        s.winners = [{ playerId: winner.player.id, amount: s.pot, hand: winner.result.name }];
-        console.log(`[Showdown] WINNER: ${winner.player.name} with ${winner.result.name} (score=${winner.result.score})`);
-    }
+    s.winners = [...winnerMap.entries()].map(([playerId, { amount, hand }]) => ({ playerId, amount, hand }));
     s.pot = 0;
     return s;
 }
