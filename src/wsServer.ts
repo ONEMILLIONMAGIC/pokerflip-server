@@ -47,6 +47,13 @@ const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; m
 }
 const ACTION_TIMEOUT_MS = 30_000
 
+// SF blind status broadcast: every 5s push current level + time-to-next to all SF tables
+setInterval(() => {
+  for (const [tableId, bs] of sfBlinds) {
+    broadcastToTable(tableId, { type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb, nextLevelAt: bs.nextAt })
+  }
+}, 5000)
+
 // Safety watchdog: every 5s scan all tables for stuck all-in states
 setInterval(() => {
   for (const [tableId, state] of tables) {
@@ -109,7 +116,7 @@ function handleMessage(ws: WebSocket, msg: any) {
       setTimeout(() => {
         let s = tables.get(tableId)
         if (!s) return
-        if (canStart(s)) { s = startHand(s); tables.set(tableId, s) }
+        if (canStartTable(tableId, s)) { s = startHand(s); tables.set(tableId, s) }
         else s.street = 'waiting' as any
         broadcastTable(tableId)
         setActionTimer(tableId)
@@ -128,7 +135,7 @@ function handleMessage(ws: WebSocket, msg: any) {
 
   if (type === 'start') {
     let state = tables.get(tableId)
-    if (!state || !canStart(state)) return send(ws, { type: 'error', message: 'Need 2+ players' })
+    if (!state || !canStartTable(tableId, state)) return send(ws, { type: 'error', message: 'Need 2+ players' })
     state = startHand(state)
     tables.set(tableId, state)
     broadcastTable(tableId)
@@ -276,7 +283,7 @@ function scheduleStart(tableId: string) {
     startTimers.delete(tableId)
     if (sfEndedTables.has(tableId)) return  // check again inside timer
     let state = tables.get(tableId)
-    if (!state || !canStart(state) || state.street !== 'waiting') return
+    if (!state || !canStartTable(tableId, state) || state.street !== 'waiting') return
 
     // SF: init blind tracker on first hand, then double blinds every 3 min
     if (tableId.startsWith('sf_')) {
@@ -294,6 +301,8 @@ function scheduleStart(tableId: string) {
         tables.set(tableId, state)
         broadcastToTable(tableId, { type: 'blind_increase', level: bs.level, sb: bs.sb, bb: bs.bb })
       }
+      // Broadcast current blind status to all players at table
+      broadcastToTable(tableId, { type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb, nextLevelAt: bs.nextAt })
     }
 
     state = startHand(state)
@@ -338,7 +347,7 @@ function resolveHandAfterDisconnect(tableId: string) {
         if (sfEndedTables.has(tableId)) return  // SF finished during saveHandStats
         let s2 = tables.get(tableId)
         if (!s2) return
-        s2 = canStart(s2) ? startHand(s2) : { ...s2, street: 'waiting' }
+        s2 = canStartTable(tableId, s2) ? startHand(s2) : { ...s2, street: 'waiting' }
         tables.set(tableId, s2)
         broadcastTable(tableId)
       }, 2000)
@@ -369,7 +378,7 @@ function foldDisconnectedPlayers(tableId: string) {
     setTimeout(() => {
       let s2 = tables.get(tableId)
       if (!s2) return
-      s2 = canStart(s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
+      s2 = canStartTable(tableId, s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
       tables.set(tableId, s2)
       broadcastTable(tableId)
       setActionTimer(tableId)
@@ -510,7 +519,7 @@ function runBoardToShowdown(tableId: string): void {
           await new Promise<void>(res => setTimeout(res, 4000))
           let s2 = tables.get(tableId)
           if (!s2) break
-          s2 = canStart(s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
+          s2 = canStartTable(tableId, s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
           tables.set(tableId, s2)
           broadcastTable(tableId)
           setActionTimer(tableId)
@@ -569,6 +578,12 @@ const TOURNAMENT_TABLE_IDS = new Set(['daily', 'weekly'])
 
 function getTableConfig(tableId: string) {
   return TABLE_CONFIG[tableId] || getSFTableConfig(tableId) || TABLE_CONFIG.main
+}
+
+// SF tables: count all players with chips (AFK included). Cash tables: require connected.
+function canStartTable(tableId: string, state: GameState): boolean {
+  if (getSFRoomId(tableId)) return state.players.filter(p => p.chips > 0).length >= 2
+  return canStart(state)
 }
 
 async function handleJoin(ws: WebSocket, msg: any) {
@@ -695,15 +710,39 @@ async function handleJoin(ws: WebSocket, msg: any) {
     logTransaction(playerId, 'table_join', -playerChips, `Buy-in at ${tableId} (${playerChips.toLocaleString()} chips)`)
   }
 
-  // On SF join: broadcast prize so clients can show the wheel
+  // SF: pre-seed other registered players as AFK so game starts even if they haven't opened WS
   if (isSFTable && process.env.DATABASE_URL) {
     const sessionId = tableId.match(/_(\d+)$/)?.[1]
     if (sessionId) {
       const db = getPool()
-      db.query(`SELECT prize FROM pf_sf_sessions WHERE id=$1`, [sessionId])
-        .then(r => {
-          if (r.rows[0]) send(ws, { type: 'sf_prize', prize: r.rows[0].prize, sessionId: Number(sessionId) })
-        }).catch(() => {})
+      // Fetch prize + seed AFK players in parallel
+      const [prizeRes, regRes] = await Promise.all([
+        db.query(`SELECT prize FROM pf_sf_sessions WHERE id=$1`, [sessionId]),
+        db.query(
+          `SELECT r.tg_id, COALESCE(u.first_name, 'Player') AS name
+           FROM pf_sf_registrations r LEFT JOIN pf_users u ON u.tg_id = r.tg_id
+           WHERE r.session_id = $1`, [sessionId]
+        ),
+      ]).catch(() => [null, null] as any)
+
+      if (prizeRes?.rows[0]) {
+        send(ws, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) })
+      }
+
+      if (regRes?.rows) {
+        let st = tables.get(tableId)!
+        for (const reg of regRes.rows) {
+          if (reg.tg_id === playerId) continue  // already seated above
+          if (st.players.find((p: any) => p.id === reg.tg_id)) continue  // already in table
+          const takenS = st.players.map((p: any) => p.seatIndex)
+          const freeSeat = Array.from({ length: maxPlayers }, (_, i) => i).find(s => !takenS.includes(s)) ?? 0
+          st = addPlayer(st, reg.tg_id, reg.name, config.minBuyIn, freeSeat)
+          // Mark as AFK (not connected via WS yet)
+          const afkP = st.players.find((p: any) => p.id === reg.tg_id)
+          if (afkP) afkP.connected = false
+        }
+        tables.set(tableId, st)
+      }
     }
   }
 
