@@ -19,6 +19,9 @@ const afkTimers = new Map<string, NodeJS.Timeout>()   // key: tableId:playerId
 const playerBanks = new Map<string, number>()          // key: tableId:playerId → chips left in bank (DB - buyIn)
 const runoutTables = new Set<string>()                 // tables currently in all-in board runout
 
+// SF blind level: doubles every 3 minutes
+const sfBlinds = new Map<string, { level: number; sb: number; bb: number; nextAt: number }>()
+
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
   // NL Hold'em
   main:     { sb: 10,  bb: 20,  minBuyIn: 400 },
@@ -269,6 +272,25 @@ function scheduleStart(tableId: string) {
     startTimers.delete(tableId)
     let state = tables.get(tableId)
     if (!state || !canStart(state) || state.street !== 'waiting') return
+
+    // SF: init blind tracker on first hand, then double blinds every 3 min
+    if (tableId.startsWith('sf_')) {
+      if (!sfBlinds.has(tableId)) {
+        const cfg = getTableConfig(tableId)
+        sfBlinds.set(tableId, { level: 0, sb: cfg.sb, bb: cfg.bb, nextAt: Date.now() + 3 * 60_000 })
+      }
+      const bs = sfBlinds.get(tableId)!
+      if (Date.now() >= bs.nextAt) {
+        bs.level++
+        bs.sb *= 2
+        bs.bb *= 2
+        bs.nextAt = Date.now() + 3 * 60_000
+        state = { ...state, smallBlind: bs.sb, bigBlind: bs.bb, minRaise: bs.bb }
+        tables.set(tableId, state)
+        broadcastToTable(tableId, { type: 'blind_increase', level: bs.level, sb: bs.sb, bb: bs.bb })
+      }
+    }
+
     state = startHand(state)
     tables.set(tableId, state)
     broadcastTable(tableId)

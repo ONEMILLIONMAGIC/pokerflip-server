@@ -330,12 +330,17 @@ const TOURNAMENT_CONFIGS: Record<string, { basePrize: number; buyIn: number; nex
   weekly: { basePrize: 300_000, buyIn: 5_000, nextAt: () => nextOccurrence(21, 0, 0), hour: 21, weekday: 0 },
 }
 
-// Cycle key = "daily-2026-05-21" or "weekly-2026-W21"
+// Cycle key = "daily-2026-05-21" or "weekly-2026-05-19" (Monday of ISO week)
 function cycleKey(id: string): string {
   const now = new Date()
   if (id === 'weekly') {
-    const week = Math.ceil((now.getDate() - now.getDay() + 1) / 7)
-    return `${id}-${now.getFullYear()}-W${String(now.getMonth() + 1).padStart(2,'0')}${week}`
+    // Key = date of Monday of the current ISO week (Mon–Sun stay on the same key)
+    // Prevents refunds when Sunday arrives before the tournament fires
+    const d = new Date(now)
+    const day = d.getDay() // 0=Sun, 1=Mon…6=Sat
+    const daysFromMonday = day === 0 ? 6 : day - 1
+    d.setDate(d.getDate() - daysFromMonday)
+    return `${id}-${d.toISOString().slice(0, 10)}`
   }
   return `${id}-${now.toISOString().slice(0,10)}`
 }
