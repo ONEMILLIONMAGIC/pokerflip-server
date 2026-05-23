@@ -22,6 +22,9 @@ const runoutTables = new Set<string>()                 // tables currently in al
 // SF blind level: doubles every 3 minutes
 const sfBlinds = new Map<string, { level: number; sb: number; bb: number; nextAt: number }>()
 
+// SF sessions that have already ended — guard against double-completion and stale hand starts
+const sfEndedTables = new Set<string>()
+
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
   // NL Hold'em
   main:     { sb: 10,  bb: 20,  minBuyIn: 400 },
@@ -268,8 +271,10 @@ function handleDisconnect(ws: WebSocket) {
 
 function scheduleStart(tableId: string) {
   if (startTimers.has(tableId)) return
+  if (sfEndedTables.has(tableId)) return  // SF game already finished
   const timer = setTimeout(() => {
     startTimers.delete(tableId)
+    if (sfEndedTables.has(tableId)) return  // check again inside timer
     let state = tables.get(tableId)
     if (!state || !canStart(state) || state.street !== 'waiting') return
 
@@ -330,6 +335,7 @@ function resolveHandAfterDisconnect(tableId: string) {
     if (newState.street === 'showdown') {
       saveHandStats(newState).catch(console.error)
       setTimeout(() => {
+        if (sfEndedTables.has(tableId)) return  // SF finished during saveHandStats
         let s2 = tables.get(tableId)
         if (!s2) return
         s2 = canStart(s2) ? startHand(s2) : { ...s2, street: 'waiting' }
@@ -710,13 +716,46 @@ async function checkSFEnd(state: GameState) {
   const tableId = state.tableId
   const sessionId = Number(tableId.match(/_(\d+)$/)?.[1])
   if (!sessionId) return
-  const alive = state.players.filter(p => ((playerBanks.get(`${tableId}:${p.id}`) ?? 0) + p.chips) > 0)
+  if (sfEndedTables.has(tableId)) return  // already ended — prevent double-call
+
+  // FIX: SF buy-in is deducted at registration; playerBanks = real user balance (unrelated to game).
+  // Only check play chips — a player is eliminated when their in-game stack hits 0.
+  const alive = state.players.filter(p => p.chips > 0)
   if (alive.length > 1) return
-  const winner = alive[0] || state.players[0]
+
+  const winner = alive[0] || state.players.reduce((best, p) => p.chips > best.chips ? p : best, state.players[0])
   if (!winner) return
-  const result = await completeSFSession(sessionId, winner.id, winner.name).catch(e => { console.error('SF complete error:', e); return null })
+
+  sfEndedTables.add(tableId)  // mark before async call to prevent race condition
+
+  const result = await completeSFSession(sessionId, winner.id, winner.name).catch(e => {
+    console.error('SF complete error:', e)
+    sfEndedTables.delete(tableId)  // allow retry on error
+    return null
+  })
   if (!result) return
-  broadcastToTable(tableId, { type: 'tournament_end', winnerId: winner.id, winnerName: winner.name, prize: result.prize, tableId })
+
+  broadcastToTable(tableId, {
+    type: 'tournament_end',
+    winnerId: winner.id, winnerName: winner.name,
+    prize: result.prize, tableId,
+  })
+  console.log(`SF ${tableId} finished — winner: ${winner.id}, prize: ${result.prize}`)
+
+  // Clean up in-memory resources after clients receive the event
+  setTimeout(() => {
+    tables.delete(tableId)
+    sfBlinds.delete(tableId)
+    sfEndedTables.delete(tableId)
+    clearActionTimer(tableId)
+    const st = startTimers.get(tableId)
+    if (st) { clearTimeout(st); startTimers.delete(tableId) }
+    for (const key of [...playerBanks.keys()]) {
+      if (key.startsWith(`${tableId}:`)) playerBanks.delete(key)
+    }
+    runoutTables.delete(tableId)
+    console.log(`SF table ${tableId} resources cleaned up`)
+  }, 9000)
 }
 
 async function saveHandStats(state: GameState) {

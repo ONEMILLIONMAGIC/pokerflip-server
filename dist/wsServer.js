@@ -5,6 +5,7 @@ exports.getTableStats = getTableStats;
 const ws_1 = require("ws");
 const game_1 = require("./engine/game");
 const db_1 = require("./db");
+const spinFlip_1 = require("./spinFlip");
 const tables = new Map();
 const clients = new Map();
 const startTimers = new Map();
@@ -12,6 +13,10 @@ const actionTimers = new Map();
 const afkTimers = new Map(); // key: tableId:playerId
 const playerBanks = new Map(); // key: tableId:playerId → chips left in bank (DB - buyIn)
 const runoutTables = new Set(); // tables currently in all-in board runout
+// SF blind level: doubles every 3 minutes
+const sfBlinds = new Map();
+// SF sessions that have already ended — guard against double-completion and stale hand starts
+const sfEndedTables = new Set();
 const TABLE_CONFIG = {
     // NL Hold'em
     main: { sb: 10, bb: 20, minBuyIn: 400 },
@@ -208,11 +213,17 @@ function handleDisconnect(ws) {
     if (player && process.env.DATABASE_URL) {
         const bankKey = `${tableId}:${playerId}`;
         const bank = playerBanks.get(bankKey) ?? 0;
-        const totalToSave = bank + player.chips;
-        (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [totalToSave, playerId])
-            .catch(e => console.error('Failed to save chips on disconnect:', e));
-        if (player.chips !== 0) {
-            (0, db_1.logTransaction)(playerId, 'table_leave', player.chips, `Cash out from ${tableId} (${player.chips.toLocaleString()} chips)`);
+        if ((0, spinFlip_1.getSFRoomId)(tableId)) {
+            // SF: buy-in already deducted at registration; play chips don't cash out
+            // DB balance stays at bank (no additional changes)
+        }
+        else {
+            const totalToSave = bank + player.chips;
+            (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [totalToSave, playerId])
+                .catch(e => console.error('Failed to save chips on disconnect:', e));
+            if (player.chips !== 0) {
+                (0, db_1.logTransaction)(playerId, 'table_leave', player.chips, `Cash out from ${tableId} (${player.chips.toLocaleString()} chips)`);
+            }
         }
     }
     // Mark as AFK/disconnected (not removed yet — give 30s to reconnect)
@@ -248,11 +259,32 @@ function handleDisconnect(ws) {
 function scheduleStart(tableId) {
     if (startTimers.has(tableId))
         return;
+    if (sfEndedTables.has(tableId))
+        return; // SF game already finished
     const timer = setTimeout(() => {
         startTimers.delete(tableId);
+        if (sfEndedTables.has(tableId))
+            return; // check again inside timer
         let state = tables.get(tableId);
         if (!state || !(0, game_1.canStart)(state) || state.street !== 'waiting')
             return;
+        // SF: init blind tracker on first hand, then double blinds every 3 min
+        if (tableId.startsWith('sf_')) {
+            if (!sfBlinds.has(tableId)) {
+                const cfg = getTableConfig(tableId);
+                sfBlinds.set(tableId, { level: 0, sb: cfg.sb, bb: cfg.bb, nextAt: Date.now() + 3 * 60000 });
+            }
+            const bs = sfBlinds.get(tableId);
+            if (Date.now() >= bs.nextAt) {
+                bs.level++;
+                bs.sb *= 2;
+                bs.bb *= 2;
+                bs.nextAt = Date.now() + 3 * 60000;
+                state = { ...state, smallBlind: bs.sb, bigBlind: bs.bb, minRaise: bs.bb };
+                tables.set(tableId, state);
+                broadcastToTable(tableId, { type: 'blind_increase', level: bs.level, sb: bs.sb, bb: bs.bb });
+            }
+        }
         state = (0, game_1.startHand)(state);
         tables.set(tableId, state);
         broadcastTable(tableId);
@@ -286,6 +318,8 @@ function resolveHandAfterDisconnect(tableId) {
         if (newState.street === 'showdown') {
             saveHandStats(newState).catch(console.error);
             setTimeout(() => {
+                if (sfEndedTables.has(tableId))
+                    return; // SF finished during saveHandStats
                 let s2 = tables.get(tableId);
                 if (!s2)
                     return;
@@ -504,7 +538,7 @@ function send(ws, msg) {
 function getTableStats() {
     const stats = {};
     for (const [tableId, state] of tables) {
-        const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main;
+        const config = getTableConfig(tableId);
         stats[tableId] = {
             players: state.players.filter(p => p.connected).length,
             maxPlayers: config.maxPlayers || 6,
@@ -514,12 +548,16 @@ function getTableStats() {
     return stats;
 }
 const TOURNAMENT_TABLE_IDS = new Set(['daily', 'weekly']);
+function getTableConfig(tableId) {
+    return TABLE_CONFIG[tableId] || (0, spinFlip_1.getSFTableConfig)(tableId) || TABLE_CONFIG.main;
+}
 async function handleJoin(ws, msg) {
     const { tableId = 'main', playerId, playerName, buyIn: requestedBuyIn } = msg;
     if (!playerId || !playerName)
         return send(ws, { type: 'error', message: 'Need playerId and playerName' });
-    const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main;
-    // Tournament access control: only registered players during active status
+    const config = getTableConfig(tableId);
+    const isSFTable = (0, spinFlip_1.getSFRoomId)(tableId) !== null;
+    // Tournament access control
     if (TOURNAMENT_TABLE_IDS.has(tableId) && process.env.DATABASE_URL) {
         try {
             const db = (0, db_1.getPool)();
@@ -540,6 +578,26 @@ async function handleJoin(ws, msg) {
             console.error('Tournament access check error:', e);
         }
     }
+    // Spin & Flip access control
+    if (isSFTable && process.env.DATABASE_URL) {
+        try {
+            const db = (0, db_1.getPool)();
+            const sessionId = tableId.match(/_(\d+)$/)?.[1];
+            if (!sessionId)
+                return send(ws, { type: 'error', message: 'Invalid SF table', code: 'sf_invalid' });
+            const [sRes, rRes] = await Promise.all([
+                db.query(`SELECT status, prize FROM pf_sf_sessions WHERE id=$1`, [sessionId]),
+                db.query(`SELECT 1 FROM pf_sf_registrations WHERE session_id=$1 AND tg_id=$2`, [sessionId, playerId]),
+            ]);
+            if (sRes.rows[0]?.status !== 'ready')
+                return send(ws, { type: 'error', message: 'Session not ready', code: 'sf_not_ready' });
+            if (!rRes.rows.length)
+                return send(ws, { type: 'error', message: 'Not registered for this session', code: 'sf_not_registered' });
+        }
+        catch (e) {
+            console.error('SF access check error:', e);
+        }
+    }
     // Load total chips from DB
     let totalChips = config.minBuyIn;
     if (process.env.DATABASE_URL) {
@@ -553,15 +611,24 @@ async function handleJoin(ws, msg) {
             console.error('Failed to load chips:', e);
         }
     }
-    // Check min buy-in against total chips
-    if (totalChips < config.minBuyIn) {
-        return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips for this table`, code: 'insufficient_chips', required: config.minBuyIn, have: totalChips });
+    // SF: buy-in already deducted at HTTP registration → give play stack without DB deduction
+    let playerChips;
+    let bankChips;
+    if (isSFTable) {
+        playerChips = config.minBuyIn;
+        bankChips = totalChips; // keep DB balance as bank (unchanged)
     }
-    // Use requested buy-in if valid, otherwise use total chips
-    const maxBuyIn = Math.min(totalChips, config.bb * 200);
-    const playerChips = requestedBuyIn
-        ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips))
-        : Math.min(totalChips, maxBuyIn);
+    else {
+        // Check min buy-in against total chips
+        if (totalChips < config.minBuyIn) {
+            return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips for this table`, code: 'insufficient_chips', required: config.minBuyIn, have: totalChips });
+        }
+        const maxBuyIn = Math.min(totalChips, config.bb * 200);
+        playerChips = requestedBuyIn
+            ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips))
+            : Math.min(totalChips, maxBuyIn);
+        bankChips = totalChips - playerChips;
+    }
     // Declare maxPlayers early (needed for reconnect path too)
     const maxPlayers = config.maxPlayers || 6;
     // Cancel any pending AFK removal timer for this player
@@ -598,24 +665,83 @@ async function handleJoin(ws, msg) {
     state = (0, game_1.addPlayer)(state, playerId, playerName, playerChips, seat);
     tables.set(tableId, state);
     clients.set(ws, { ws, playerId, playerName, tableId });
-    // Store bank chips (what remains in DB = totalChips - buyIn)
-    const bankChips = totalChips - playerChips;
     playerBanks.set(`${tableId}:${playerId}`, bankChips);
-    // Deduct buy-in from DB now; will add back table chips on leave
-    if (process.env.DATABASE_URL) {
+    if (!isSFTable && process.env.DATABASE_URL) {
+        // Normal table: deduct buy-in from DB now
         (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [bankChips, playerId])
             .catch(e => console.error('Failed to deduct buy-in:', e));
         (0, db_1.logTransaction)(playerId, 'table_join', -playerChips, `Buy-in at ${tableId} (${playerChips.toLocaleString()} chips)`);
     }
+    // On SF join: broadcast prize so clients can show the wheel
+    if (isSFTable && process.env.DATABASE_URL) {
+        const sessionId = tableId.match(/_(\d+)$/)?.[1];
+        if (sessionId) {
+            const db = (0, db_1.getPool)();
+            db.query(`SELECT prize FROM pf_sf_sessions WHERE id=$1`, [sessionId])
+                .then(r => {
+                if (r.rows[0])
+                    send(ws, { type: 'sf_prize', prize: r.rows[0].prize, sessionId: Number(sessionId) });
+            }).catch(() => { });
+        }
+    }
     broadcastTable(tableId);
     send(ws, { type: 'joined', playerId, tableId, chips: playerChips, maxPlayers, bank: bankChips });
     scheduleStart(tableId);
+}
+async function checkSFEnd(state) {
+    const tableId = state.tableId;
+    const sessionId = Number(tableId.match(/_(\d+)$/)?.[1]);
+    if (!sessionId)
+        return;
+    if (sfEndedTables.has(tableId))
+        return; // already ended — prevent double-call
+    // FIX: SF buy-in is deducted at registration; playerBanks = real user balance (unrelated to game).
+    // Only check play chips — a player is eliminated when their in-game stack hits 0.
+    const alive = state.players.filter(p => p.chips > 0);
+    if (alive.length > 1)
+        return;
+    const winner = alive[0] || state.players.reduce((best, p) => p.chips > best.chips ? p : best, state.players[0]);
+    if (!winner)
+        return;
+    sfEndedTables.add(tableId); // mark before async call to prevent race condition
+    const result = await (0, spinFlip_1.completeSFSession)(sessionId, winner.id, winner.name).catch(e => {
+        console.error('SF complete error:', e);
+        sfEndedTables.delete(tableId); // allow retry on error
+        return null;
+    });
+    if (!result)
+        return;
+    broadcastToTable(tableId, {
+        type: 'tournament_end',
+        winnerId: winner.id, winnerName: winner.name,
+        prize: result.prize, tableId,
+    });
+    console.log(`SF ${tableId} finished — winner: ${winner.id}, prize: ${result.prize}`);
+    // Clean up in-memory resources after clients receive the event
+    setTimeout(() => {
+        tables.delete(tableId);
+        sfBlinds.delete(tableId);
+        sfEndedTables.delete(tableId);
+        clearActionTimer(tableId);
+        const st = startTimers.get(tableId);
+        if (st) {
+            clearTimeout(st);
+            startTimers.delete(tableId);
+        }
+        for (const key of [...playerBanks.keys()]) {
+            if (key.startsWith(`${tableId}:`))
+                playerBanks.delete(key);
+        }
+        runoutTables.delete(tableId);
+        console.log(`SF table ${tableId} resources cleaned up`);
+    }, 9000);
 }
 async function saveHandStats(state) {
     if (!process.env.DATABASE_URL)
         return;
     const db = (0, db_1.getPool)();
     const winnerIds = new Set(state.winners.map(w => w.playerId));
+    const isSF = (0, spinFlip_1.getSFRoomId)(state.tableId) !== null;
     for (const player of state.players) {
         if (!player.connected)
             continue;
@@ -624,7 +750,8 @@ async function saveHandStats(state) {
         // Total chips = bank (outside table) + current table chips
         const bankKey = `${state.tableId}:${player.id}`;
         const bank = playerBanks.get(bankKey) ?? 0;
-        const totalChips = bank + player.chips;
+        // SF: play chips are separate from real balance; don't update chips during game
+        const totalChips = isSF ? bank : bank + player.chips;
         const { rows: updated } = await db.query(`UPDATE pf_users SET
         chips        = $1,
         hands_played = hands_played + 1,
@@ -659,6 +786,10 @@ async function saveHandStats(state) {
     // Tournament end: if only 1 player has chips left → distribute prizes
     if (TOURNAMENT_TABLE_IDS.has(state.tableId)) {
         await checkTournamentEnd(state).catch(e => console.error('Tournament end check error:', e));
+    }
+    // Spin & Flip end
+    if (isSF) {
+        await checkSFEnd(state).catch(e => console.error('SF end check error:', e));
     }
 }
 async function checkTournamentEnd(state) {

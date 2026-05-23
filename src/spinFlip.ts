@@ -183,6 +183,7 @@ export async function getSFStatus(tgId?: string) {
        FROM pf_sf_sessions s
        LEFT JOIN pf_sf_registrations r ON r.session_id = s.id
        WHERE s.room_id=$1 AND s.status IN ('waiting','ready')
+         AND (s.status = 'waiting' OR s.started_at > NOW() - INTERVAL '30 minutes')
        GROUP BY s.id ORDER BY s.id ASC LIMIT 1`,
       tgId ? [roomId, tgId] : [roomId]
     )

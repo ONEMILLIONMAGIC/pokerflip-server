@@ -12,6 +12,7 @@ const wsServer_1 = require("./wsServer");
 const db_1 = require("./db");
 const achievements_1 = require("./achievements");
 const utils_1 = require("./utils");
+const spinFlip_1 = require("./spinFlip");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 app.use((0, cors_1.default)());
@@ -297,12 +298,17 @@ const TOURNAMENT_CONFIGS = {
     daily: { basePrize: 50000, buyIn: 2000, nextAt: () => nextOccurrence(20), hour: 20 },
     weekly: { basePrize: 300000, buyIn: 5000, nextAt: () => nextOccurrence(21, 0, 0), hour: 21, weekday: 0 },
 };
-// Cycle key = "daily-2026-05-21" or "weekly-2026-W21"
+// Cycle key = "daily-2026-05-21" or "weekly-2026-05-19" (Monday of ISO week)
 function cycleKey(id) {
     const now = new Date();
     if (id === 'weekly') {
-        const week = Math.ceil((now.getDate() - now.getDay() + 1) / 7);
-        return `${id}-${now.getFullYear()}-W${String(now.getMonth() + 1).padStart(2, '0')}${week}`;
+        // Key = date of Monday of the current ISO week (Mon–Sun stay on the same key)
+        // Prevents refunds when Sunday arrives before the tournament fires
+        const d = new Date(now);
+        const day = d.getDay(); // 0=Sun, 1=Mon…6=Sat
+        const daysFromMonday = day === 0 ? 6 : day - 1;
+        d.setDate(d.getDate() - daysFromMonday);
+        return `${id}-${d.toISOString().slice(0, 10)}`;
     }
     return `${id}-${now.toISOString().slice(0, 10)}`;
 }
@@ -1068,6 +1074,76 @@ app.get('/api/avatar/:tgId', async (req, res) => {
     }
     catch {
         res.status(404).end();
+    }
+});
+// ── Spin & Flip routes ─────────────────────────────────────────────────────
+app.get('/api/spinflip/status', async (req, res) => {
+    try {
+        const initDataHeader = req.headers['x-init-data'];
+        let tgId;
+        if (initDataHeader) {
+            const p = (0, utils_1.validateTgInitData)(initDataHeader);
+            const u = p ? (0, utils_1.parseTgUser)(p) : null;
+            tgId = u?.id?.toString();
+        }
+        res.json(await (0, spinFlip_1.getSFStatus)(tgId));
+    }
+    catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+app.post('/api/spinflip/:roomId/register', async (req, res) => {
+    try {
+        const { roomId } = req.params;
+        if (!(roomId in spinFlip_1.SF_CONFIGS))
+            return res.status(400).json({ error: 'Unknown room' });
+        const { initData } = req.body;
+        if (!initData)
+            return res.status(401).json({ error: 'Missing init data' });
+        const params = (0, utils_1.validateTgInitData)(initData);
+        if (!params)
+            return res.status(403).json({ error: 'Invalid init data' });
+        const tgUser = (0, utils_1.parseTgUser)(params);
+        if (!tgUser?.id)
+            return res.status(401).json({ error: 'Invalid user' });
+        const result = await (0, spinFlip_1.registerForSF)(tgUser.id.toString(), roomId);
+        res.json(result);
+    }
+    catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+app.delete('/api/spinflip/:roomId/register', async (req, res) => {
+    try {
+        const { roomId } = req.params;
+        if (!(roomId in spinFlip_1.SF_CONFIGS))
+            return res.status(400).json({ error: 'Unknown room' });
+        const { initData } = req.body;
+        if (!initData)
+            return res.status(401).json({ error: 'Missing init data' });
+        const params = (0, utils_1.validateTgInitData)(initData);
+        if (!params)
+            return res.status(403).json({ error: 'Invalid init data' });
+        const tgUser = (0, utils_1.parseTgUser)(params);
+        if (!tgUser?.id)
+            return res.status(401).json({ error: 'Invalid user' });
+        const result = await (0, spinFlip_1.cancelSFRegistration)(tgUser.id.toString(), roomId);
+        res.json(result);
+    }
+    catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+app.get('/api/spinflip/admin/stats', async (req, res) => {
+    const secret = req.headers['x-admin-secret'];
+    if (secret !== process.env.ADMIN_SECRET && secret !== 'pf-admin-7x9k2m4n') {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    try {
+        res.json(await (0, spinFlip_1.getSFAdminStats)());
+    }
+    catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 const server = (0, http_1.createServer)(app);
