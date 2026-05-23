@@ -293,7 +293,7 @@ function nextActiveIdx(s: GameState, fromIdx: number): number {
   let tries = 0
   while (tries < n) {
     const p = s.players[idx]
-    if (p && !p.folded && !p.allIn && p.connected && p.chips > 0) return idx
+    if (p && !p.folded && !p.allIn && p.chips > 0) return idx
     idx = (idx + 1) % n
     tries++
   }
