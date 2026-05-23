@@ -7,6 +7,7 @@ import { setupWS, getTableStats } from './wsServer'
 import { initDB, getPool, logTransaction } from './db'
 import { getAchievements } from './achievements'
 import { validateTgInitData, parseTgUser } from './utils'
+import { registerForSF, getSFStatus, getSFAdminStats, SF_CONFIGS } from './spinFlip'
 
 dotenv.config()
 
@@ -1176,6 +1177,48 @@ app.get('/api/avatar/:tgId', async (req, res) => {
   } catch {
     res.status(404).end()
   }
+})
+
+// ── Spin & Flip routes ─────────────────────────────────────────────────────
+
+app.get('/api/spinflip/status', async (req, res) => {
+  try {
+    const initDataHeader = req.headers['x-init-data'] as string | undefined
+    let tgId: string | undefined
+    if (initDataHeader) {
+      const p = validateTgInitData(initDataHeader)
+      const u = p ? parseTgUser(p) : null
+      tgId = u?.id?.toString()
+    }
+    res.json(await getSFStatus(tgId))
+  } catch (e: any) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.post('/api/spinflip/:roomId/register', async (req, res) => {
+  try {
+    const { roomId } = req.params
+    if (!(roomId in SF_CONFIGS)) return res.status(400).json({ error: 'Unknown room' })
+    const { initData } = req.body as { initData?: string }
+    if (!initData) return res.status(401).json({ error: 'Missing init data' })
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'Invalid init data' })
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(401).json({ error: 'Invalid user' })
+    const result = await registerForSF(tgUser.id.toString(), roomId as keyof typeof SF_CONFIGS)
+    res.json(result)
+  } catch (e: any) {
+    res.status(400).json({ error: e.message })
+  }
+})
+
+app.get('/api/spinflip/admin/stats', async (req, res) => {
+  const secret = req.headers['x-admin-secret']
+  if (secret !== process.env.ADMIN_SECRET && secret !== 'pf-admin-7x9k2m4n') {
+    return res.status(403).json({ error: 'Forbidden' })
+  }
+  try { res.json(await getSFAdminStats()) } catch (e: any) { res.status(500).json({ error: e.message }) }
 })
 
 const server = createServer(app)

@@ -1,6 +1,7 @@
 import { WebSocket, WebSocketServer } from 'ws'
 import { GameState, createTable, addPlayer, removePlayer, startHand, applyAction, advanceStreet, canStart, maskForPlayer, PlayerAction } from './engine/game'
 import { getPool, logTransaction } from './db'
+import { getSFRoomId, getSFTableConfig, completeSFSession } from './spinFlip'
 
 interface Client {
   ws: WebSocket
@@ -216,11 +217,16 @@ function handleDisconnect(ws: WebSocket) {
   if (player && process.env.DATABASE_URL) {
     const bankKey = `${tableId}:${playerId}`
     const bank = playerBanks.get(bankKey) ?? 0
-    const totalToSave = bank + player.chips
-    getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [totalToSave, playerId])
-      .catch(e => console.error('Failed to save chips on disconnect:', e))
-    if (player.chips !== 0) {
-      logTransaction(playerId, 'table_leave', player.chips, `Cash out from ${tableId} (${player.chips.toLocaleString()} chips)`)
+    if (getSFRoomId(tableId)) {
+      // SF: buy-in already deducted at registration; play chips don't cash out
+      // DB balance stays at bank (no additional changes)
+    } else {
+      const totalToSave = bank + player.chips
+      getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [totalToSave, playerId])
+        .catch(e => console.error('Failed to save chips on disconnect:', e))
+      if (player.chips !== 0) {
+        logTransaction(playerId, 'table_leave', player.chips, `Cash out from ${tableId} (${player.chips.toLocaleString()} chips)`)
+      }
     }
   }
 
@@ -521,7 +527,7 @@ function send(ws: WebSocket, msg: object) {
 export function getTableStats(): Record<string, { players: number; maxPlayers: number; street: string }> {
   const stats: Record<string, { players: number; maxPlayers: number; street: string }> = {}
   for (const [tableId, state] of tables) {
-    const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main
+    const config = getTableConfig(tableId)
     stats[tableId] = {
       players: state.players.filter(p => p.connected).length,
       maxPlayers: config.maxPlayers || 6,
@@ -533,13 +539,19 @@ export function getTableStats(): Record<string, { players: number; maxPlayers: n
 
 const TOURNAMENT_TABLE_IDS = new Set(['daily', 'weekly'])
 
+function getTableConfig(tableId: string) {
+  return TABLE_CONFIG[tableId] || getSFTableConfig(tableId) || TABLE_CONFIG.main
+}
+
 async function handleJoin(ws: WebSocket, msg: any) {
   const { tableId = 'main', playerId, playerName, buyIn: requestedBuyIn } = msg
   if (!playerId || !playerName) return send(ws, { type: 'error', message: 'Need playerId and playerName' })
 
-  const config = TABLE_CONFIG[tableId] || TABLE_CONFIG.main
+  const config = getTableConfig(tableId)
 
-  // Tournament access control: only registered players during active status
+  const isSFTable = getSFRoomId(tableId) !== null
+
+  // Tournament access control
   if (TOURNAMENT_TABLE_IDS.has(tableId) && process.env.DATABASE_URL) {
     try {
       const db = getPool()
@@ -560,6 +572,23 @@ async function handleJoin(ws: WebSocket, msg: any) {
     }
   }
 
+  // Spin & Flip access control
+  if (isSFTable && process.env.DATABASE_URL) {
+    try {
+      const db = getPool()
+      const sessionId = tableId.match(/_(\d+)$/)?.[1]
+      if (!sessionId) return send(ws, { type: 'error', message: 'Invalid SF table', code: 'sf_invalid' })
+      const [sRes, rRes] = await Promise.all([
+        db.query(`SELECT status, prize FROM pf_sf_sessions WHERE id=$1`, [sessionId]),
+        db.query(`SELECT 1 FROM pf_sf_registrations WHERE session_id=$1 AND tg_id=$2`, [sessionId, playerId]),
+      ])
+      if (sRes.rows[0]?.status !== 'ready') return send(ws, { type: 'error', message: 'Session not ready', code: 'sf_not_ready' })
+      if (!rRes.rows.length) return send(ws, { type: 'error', message: 'Not registered for this session', code: 'sf_not_registered' })
+    } catch (e) {
+      console.error('SF access check error:', e)
+    }
+  }
+
   // Load total chips from DB
   let totalChips = config.minBuyIn
   if (process.env.DATABASE_URL) {
@@ -572,16 +601,23 @@ async function handleJoin(ws: WebSocket, msg: any) {
     }
   }
 
-  // Check min buy-in against total chips
-  if (totalChips < config.minBuyIn) {
-    return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips for this table`, code: 'insufficient_chips', required: config.minBuyIn, have: totalChips })
+  // SF: buy-in already deducted at HTTP registration → give play stack without DB deduction
+  let playerChips: number
+  let bankChips: number
+  if (isSFTable) {
+    playerChips = config.minBuyIn
+    bankChips = totalChips  // keep DB balance as bank (unchanged)
+  } else {
+    // Check min buy-in against total chips
+    if (totalChips < config.minBuyIn) {
+      return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips for this table`, code: 'insufficient_chips', required: config.minBuyIn, have: totalChips })
+    }
+    const maxBuyIn = Math.min(totalChips, config.bb * 200)
+    playerChips = requestedBuyIn
+      ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips))
+      : Math.min(totalChips, maxBuyIn)
+    bankChips = totalChips - playerChips
   }
-
-  // Use requested buy-in if valid, otherwise use total chips
-  const maxBuyIn = Math.min(totalChips, config.bb * 200)
-  const playerChips = requestedBuyIn
-    ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips))
-    : Math.min(totalChips, maxBuyIn)
 
   // Declare maxPlayers early (needed for reconnect path too)
   const maxPlayers = config.maxPlayers || 6
@@ -622,15 +658,25 @@ async function handleJoin(ws: WebSocket, msg: any) {
   tables.set(tableId, state)
   clients.set(ws, { ws, playerId, playerName, tableId })
 
-  // Store bank chips (what remains in DB = totalChips - buyIn)
-  const bankChips = totalChips - playerChips
   playerBanks.set(`${tableId}:${playerId}`, bankChips)
 
-  // Deduct buy-in from DB now; will add back table chips on leave
-  if (process.env.DATABASE_URL) {
+  if (!isSFTable && process.env.DATABASE_URL) {
+    // Normal table: deduct buy-in from DB now
     getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [bankChips, playerId])
       .catch(e => console.error('Failed to deduct buy-in:', e))
     logTransaction(playerId, 'table_join', -playerChips, `Buy-in at ${tableId} (${playerChips.toLocaleString()} chips)`)
+  }
+
+  // On SF join: broadcast prize so clients can show the wheel
+  if (isSFTable && process.env.DATABASE_URL) {
+    const sessionId = tableId.match(/_(\d+)$/)?.[1]
+    if (sessionId) {
+      const db = getPool()
+      db.query(`SELECT prize FROM pf_sf_sessions WHERE id=$1`, [sessionId])
+        .then(r => {
+          if (r.rows[0]) send(ws, { type: 'sf_prize', prize: r.rows[0].prize, sessionId: Number(sessionId) })
+        }).catch(() => {})
+    }
   }
 
   broadcastTable(tableId)
@@ -638,10 +684,25 @@ async function handleJoin(ws: WebSocket, msg: any) {
   scheduleStart(tableId)
 }
 
+async function checkSFEnd(state: GameState) {
+  const tableId = state.tableId
+  const sessionId = Number(tableId.match(/_(\d+)$/)?.[1])
+  if (!sessionId) return
+  const alive = state.players.filter(p => ((playerBanks.get(`${tableId}:${p.id}`) ?? 0) + p.chips) > 0)
+  if (alive.length > 1) return
+  const winner = alive[0] || state.players[0]
+  if (!winner) return
+  const result = await completeSFSession(sessionId, winner.id, winner.name).catch(e => { console.error('SF complete error:', e); return null })
+  if (!result) return
+  broadcastToTable(tableId, { type: 'tournament_end', winnerId: winner.id, winnerName: winner.name, prize: result.prize, tableId })
+}
+
 async function saveHandStats(state: GameState) {
   if (!process.env.DATABASE_URL) return
   const db = getPool()
   const winnerIds = new Set(state.winners.map(w => w.playerId))
+
+  const isSF = getSFRoomId(state.tableId) !== null
 
   for (const player of state.players) {
     if (!player.connected) continue
@@ -651,7 +712,8 @@ async function saveHandStats(state: GameState) {
     // Total chips = bank (outside table) + current table chips
     const bankKey = `${state.tableId}:${player.id}`
     const bank = playerBanks.get(bankKey) ?? 0
-    const totalChips = bank + player.chips
+    // SF: play chips are separate from real balance; don't update chips during game
+    const totalChips = isSF ? bank : bank + player.chips
 
     const { rows: updated } = await db.query(
       `UPDATE pf_users SET
@@ -703,6 +765,10 @@ async function saveHandStats(state: GameState) {
   // Tournament end: if only 1 player has chips left → distribute prizes
   if (TOURNAMENT_TABLE_IDS.has(state.tableId)) {
     await checkTournamentEnd(state).catch(e => console.error('Tournament end check error:', e))
+  }
+  // Spin & Flip end
+  if (isSF) {
+    await checkSFEnd(state).catch(e => console.error('SF end check error:', e))
   }
 }
 

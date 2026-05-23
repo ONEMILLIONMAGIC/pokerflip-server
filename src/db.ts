@@ -126,4 +126,43 @@ export async function initDB() {
       finished_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `)
+
+  // Spin & Flip
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS pf_sf_sessions (
+      id           SERIAL PRIMARY KEY,
+      room_id      TEXT NOT NULL,
+      status       TEXT NOT NULL DEFAULT 'waiting',
+      prize        INTEGER NOT NULL DEFAULT 0,
+      table_id     TEXT,
+      winner_tg_id TEXT,
+      started_at   TIMESTAMPTZ,
+      finished_at  TIMESTAMPTZ
+    )
+  `)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS pf_sf_registrations (
+      session_id   INTEGER NOT NULL,
+      tg_id        TEXT NOT NULL,
+      registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (session_id, tg_id)
+    )
+  `)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS pf_sf_bankroll (
+      room_id   TEXT PRIMARY KEY,
+      chips     BIGINT NOT NULL DEFAULT 0,
+      total_in  BIGINT NOT NULL DEFAULT 0,
+      total_out BIGINT NOT NULL DEFAULT 0,
+      rounds    INTEGER NOT NULL DEFAULT 0
+    )
+  `)
+  // Seed initial bankrolls (only if not already present)
+  await db.query(`
+    INSERT INTO pf_sf_bankroll (room_id, chips) VALUES
+      ('sf_rush',   100000),
+      ('sf_clash',  300000),
+      ('sf_royale', 500000)
+    ON CONFLICT DO NOTHING
+  `)
 }
