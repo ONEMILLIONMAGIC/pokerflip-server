@@ -57,15 +57,19 @@ setInterval(() => {
   }
 }, 5000)
 
-// Safety watchdog: every 5s scan all tables for stuck all-in states
+// Safety watchdog: every 5s scan all tables for stuck states (all-in OR no timer)
 setInterval(() => {
   for (const [tableId, state] of tables) {
     if (state.street === 'waiting' || state.street === 'showdown') continue
     if (runoutTables.has(tableId)) continue
-    if (actionTimers.has(tableId)) continue  // normal action timer is running
+    if (actionTimers.has(tableId)) continue
     if (canAutoRunBoard(state)) {
-      console.log(`[Watchdog] ${tableId}: stuck board at ${state.street}, triggering runout`)
+      console.log(`[Watchdog] ${tableId}: stuck all-in at ${state.street}, triggering runout`)
       runBoardToShowdown(tableId)
+    } else {
+      // Hand in progress but no action timer — restart (e.g. after reconnect or missed setActionTimer)
+      console.log(`[Watchdog] ${tableId}: no action timer at ${state.street}, restarting`)
+      setActionTimer(tableId)
     }
   }
 }, 5000)
@@ -364,12 +368,13 @@ function resolveHandAfterDisconnect(tableId: string) {
     if (newState.street === 'showdown') {
       saveHandStats(newState).catch(console.error)
       setTimeout(() => {
-        if (sfEndedTables.has(tableId)) return  // SF finished during saveHandStats
+        if (sfEndedTables.has(tableId)) return
         let s2 = tables.get(tableId)
         if (!s2) return
         s2 = canStartTable(tableId, s2) ? startHand(s2) : { ...s2, street: 'waiting' }
         tables.set(tableId, s2)
         broadcastTable(tableId)
+        setActionTimer(tableId)  // critical: keeps hand loop alive after reconnect-triggered showdown
       }, 2000)
     }
     return
@@ -737,7 +742,14 @@ async function handleJoin(ws: WebSocket, msg: any) {
     broadcastTable(tableId)
     send(ws, { type: 'joined', playerId, tableId, chips: reconnectingPlayer.chips, maxPlayers })
     console.log(`Player ${playerId} reconnected to ${tableId} with ${reconnectingPlayer.chips} chips`)
-    scheduleStart(tableId)
+    // If a hand is already in progress and no action timer is running, restart it.
+    // This fixes the case where resolveHandAfterDisconnect started a hand without a timer.
+    const midHand = state.street !== 'waiting' && state.street !== 'showdown'
+    if (midHand && !actionTimers.has(tableId) && !runoutTables.has(tableId)) {
+      setActionTimer(tableId)
+    } else {
+      scheduleStart(tableId)
+    }
     return
   }
 
