@@ -179,7 +179,7 @@ function handleMessage(ws: WebSocket, msg: any) {
 
   // Emoji reaction — broadcast to all at table
   if (type === 'reaction') {
-    const emoji = String(msg.emoji || '👏').slice(0, 2)
+    const emoji = String(msg.emoji || 'gg').slice(0, 20)
     broadcastToTable(tableId, { type: 'reaction', playerId, playerName: client.playerName, emoji })
     return
   }
