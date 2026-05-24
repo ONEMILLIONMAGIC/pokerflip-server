@@ -58,7 +58,8 @@ app.post('/api/webhook', async (req, res) => {
 
     const chatId = msg.chat.id
     const tgId = String(msg.from?.id || chatId)
-    const text = (msg.text || '').trim()
+    // Strip @botname from commands: /admin@pokerflip_bot lookup X → /admin lookup X
+    const text = (msg.text || '').trim().replace(/^(\/\w+)@\w+/, '$1')
     const firstName = msg.from?.first_name || 'Player'
 
     if (text.startsWith('/start')) {
