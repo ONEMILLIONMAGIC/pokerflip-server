@@ -139,6 +139,7 @@ app.post('/api/webhook', async (req, res) => {
     // Admin commands (only for admin tgId)
     else if (String(chatId) === (process.env.ADMIN_TG_ID || '501197162')) {
       const db = getPool()
+      try {
       if (text?.startsWith('/admin credit ')) {
         // /admin credit <tgId> <amount> [reason]
         const parts = text.split(' ')
@@ -201,14 +202,14 @@ app.post('/api/webhook', async (req, res) => {
           [`%${q}%`]
         )
         if (!rows.length) {
-          await tgSend(chatId, `❌ No users found for "${q}"`)
+          await tgSend(chatId, `No users found for "${q}"`, { parse_mode: undefined as any })
         } else {
           const lines = rows.map((r: any) =>
-            `*${r.first_name}* (@${r.username || '—'}) id: \`${r.tg_id}\`\n` +
-            `chips: ${r.chips?.toLocaleString()} | hands: ${r.hands_played}\n` +
-            `referred_by: ${r.referred_by || '—'} | bonus: ${r.referral_bonus || 0} | credited: ${r.referral_credited}`
+            `${r.first_name} (@${r.username || '-'}) id: ${r.tg_id}\n` +
+            `chips: ${(r.chips || 0).toLocaleString()} | hands: ${r.hands_played}\n` +
+            `referred_by: ${r.referred_by || '-'} | bonus: ${r.referral_bonus || 0} | credited: ${r.referral_credited}`
           )
-          await tgSend(chatId, `🔍 *Found ${rows.length} user(s):*\n\n${lines.join('\n\n')}`)
+          await tgSend(chatId, `Found ${rows.length} user(s):\n\n${lines.join('\n\n')}`, { parse_mode: undefined as any })
         }
 
       } else if (text?.startsWith('/admin referral ')) {
@@ -283,6 +284,10 @@ app.post('/api/webhook', async (req, res) => {
           `/admin referral <user_id> <referrer_id> — manually set referral\n` +
           `/admin credit <tgId> <amount> [reason] — credit chips\n` +
           `/admin sf clean — refund all SF registrations & clear stale sessions`)
+      }
+      } catch (adminErr) {
+        console.error('Admin command error:', adminErr)
+        await tgSend(chatId, `⚠️ Error: ${String(adminErr)}`, { parse_mode: undefined as any })
       }
     }
 
