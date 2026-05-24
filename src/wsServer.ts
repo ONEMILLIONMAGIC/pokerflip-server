@@ -22,6 +22,9 @@ const runoutTables = new Set<string>()                 // tables currently in al
 // SF blind level: doubles every 3 minutes
 const sfBlinds = new Map<string, { level: number; sb: number; bb: number; nextAt: number }>()
 
+// SF tables where blind increase timer fired during an active hand — deferred to next hand
+const sfBlindPendingNotified = new Set<string>()
+
 // SF sessions that have already ended — guard against double-completion and stale hand starts
 const sfEndedTables = new Set<string>()
 
@@ -53,7 +56,18 @@ const ACTION_TIMEOUT_MS = 30_000
 // SF blind status broadcast: every 5s push current level + time-to-next to all SF tables
 setInterval(() => {
   for (const [tableId, bs] of sfBlinds) {
-    broadcastToTable(tableId, { type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb, nextLevelAt: bs.nextAt })
+    const state = tables.get(tableId)
+    const inHand = state && state.street !== 'waiting' && state.street !== 'showdown'
+    const isPending = Date.now() >= bs.nextAt
+    broadcastToTable(tableId, {
+      type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb,
+      nextLevelAt: bs.nextAt, blindsPending: isPending && !!inHand
+    })
+    // One-time notification when timer fires during an active hand (classic poker deferred raise)
+    if (isPending && inHand && !sfBlindPendingNotified.has(tableId)) {
+      sfBlindPendingNotified.add(tableId)
+      broadcastToTable(tableId, { type: 'blind_pending_increase', nextSb: bs.sb * 2, nextBb: bs.bb * 2 })
+    }
   }
 }, 5000)
 
@@ -321,6 +335,7 @@ function scheduleStart(tableId: string) {
         bs.sb *= 2
         bs.bb *= 2
         bs.nextAt = Date.now() + 3 * 60_000
+        sfBlindPendingNotified.delete(tableId)  // clear pending flag — blinds now applied
         state = { ...state, smallBlind: bs.sb, bigBlind: bs.bb, minRaise: bs.bb }
         tables.set(tableId, state)
         broadcastToTable(tableId, { type: 'blind_increase', level: bs.level, sb: bs.sb, bb: bs.bb })
@@ -337,51 +352,73 @@ function scheduleStart(tableId: string) {
   startTimers.set(tableId, timer)
 }
 
-// If only 1 connected non-folded player remains, end the hand immediately and give them the pot.
-// Otherwise fall back to foldDisconnectedPlayers.
+// Resolve the hand after a disconnect event.
+// Industry standard (TDA rule): auto-fold the disconnected player when it's their turn;
+// if no connected player can act, force-resolve and schedule next hand.
 function resolveHandAfterDisconnect(tableId: string) {
   let s = tables.get(tableId)
   if (!s || s.street === 'waiting' || s.street === 'showdown') return
 
-  const connectedActive = s.players.filter(p => p.connected && !p.folded)
-
-  if (connectedActive.length <= 1) {
-    clearActionTimer(tableId)
-    // Fold all disconnected non-folded players
-    const players = s.players.map(p =>
-      (!p.connected && !p.folded) ? { ...p, folded: true, hasActed: true } : { ...p }
-    )
-    const notFolded = players.filter(p => !p.folded)
-    let newState: typeof s = { ...s, players }
-
-    if (notFolded.length === 1) {
-      const winner = notFolded[0]
-      players.find(p => p.id === winner.id)!.chips += newState.pot
-      newState = { ...newState, players, winners: [{ playerId: winner.id, amount: newState.pot, hand: 'Last standing' }], pot: 0, street: 'showdown' }
-    } else {
-      newState = { ...newState, street: 'waiting' }
-    }
-
-    tables.set(tableId, newState)
-    broadcastTable(tableId)
-
-    if (newState.street === 'showdown') {
-      saveHandStats(newState).catch(console.error)
-      setTimeout(() => {
-        if (sfEndedTables.has(tableId)) return
-        let s2 = tables.get(tableId)
-        if (!s2) return
-        s2 = canStartTable(tableId, s2) ? startHand(s2) : { ...s2, street: 'waiting' }
-        tables.set(tableId, s2)
-        broadcastTable(tableId)
-        setActionTimer(tableId)  // critical: keeps hand loop alive after reconnect-triggered showdown
-      }, 2000)
-    }
+  // If board can already auto-run (all-in situation), trigger it
+  if (canAutoRunBoard(s)) {
+    if (!runoutTables.has(tableId)) runBoardToShowdown(tableId)
     return
   }
 
-  // Multiple connected players remain — use normal per-turn fold logic
-  foldDisconnectedPlayers(tableId)
+  // Players who are connected AND can still voluntarily act
+  const canAct = s.players.filter(p => p.connected && !p.folded && !p.allIn)
+
+  if (canAct.length > 0) {
+    // At least one connected player can still act — just fold the disconnected turn player (if any)
+    foldDisconnectedPlayers(tableId)
+    return
+  }
+
+  // Nobody can act (all disconnected / all-in) — force-resolve the hand
+  clearActionTimer(tableId)
+
+  // Fold all disconnected non-folded non-allin players
+  const players = s.players.map(p =>
+    (!p.connected && !p.folded && !p.allIn) ? { ...p, folded: true, hasActed: true } : { ...p }
+  )
+  const notFolded = players.filter(p => !p.folded)
+  let newState: typeof s = { ...s, players }
+
+  if (notFolded.length === 1) {
+    // One player left (all-in or last standing) — award pot
+    const winner = notFolded[0]
+    const ps = players.map(p => p.id === winner.id ? { ...p, chips: p.chips + newState.pot } : p)
+    newState = { ...newState, players: ps, winners: [{ playerId: winner.id, amount: newState.pot, hand: 'Last standing' }], pot: 0, street: 'showdown' }
+  } else if (notFolded.length > 1) {
+    // Multiple all-in players remaining — run the board automatically
+    tables.set(tableId, newState)
+    broadcastTable(tableId)
+    runBoardToShowdown(tableId)
+    return
+  } else {
+    // Everyone folded — return outstanding bets, reset to waiting (industry: no winner declared)
+    const ps = players.map(p => ({ ...p, chips: p.chips + (p.bet ?? 0), bet: 0, totalBet: 0 }))
+    newState = { ...newState, players: ps, pot: 0, street: 'waiting' }
+  }
+
+  tables.set(tableId, newState)
+  broadcastTable(tableId)
+
+  if (newState.street === 'showdown') {
+    saveHandStats(newState).catch(console.error)
+    setTimeout(() => {
+      if (sfEndedTables.has(tableId)) return
+      let s2 = tables.get(tableId)
+      if (!s2) return
+      s2 = canStartTable(tableId, s2) ? startHand(s2) : { ...s2, street: 'waiting' }
+      tables.set(tableId, s2)
+      broadcastTable(tableId)
+      setActionTimer(tableId)
+    }, 2000)
+  } else {
+    // Waiting state — schedule next hand so the loop doesn't stall
+    scheduleStart(tableId)
+  }
 }
 
 // Fold all disconnected players who need to act, until a connected player's turn.
