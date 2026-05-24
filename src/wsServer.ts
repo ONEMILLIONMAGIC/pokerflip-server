@@ -410,13 +410,13 @@ function resolveHandAfterDisconnect(tableId: string) {
       if (sfEndedTables.has(tableId)) return
       let s2 = tables.get(tableId)
       if (!s2) return
-      s2 = canStartTable(tableId, s2) ? startHand(s2) : { ...s2, street: 'waiting' }
-      tables.set(tableId, s2)
-      broadcastTable(tableId)
-      setActionTimer(tableId)
+      if (canStartTable(tableId, s2)) {
+        s2 = startHand(s2); tables.set(tableId, s2); broadcastTable(tableId); setActionTimer(tableId)
+      } else {
+        tables.set(tableId, { ...s2, street: 'waiting' }); broadcastTable(tableId); scheduleStart(tableId)
+      }
     }, 2000)
   } else {
-    // Waiting state — schedule next hand so the loop doesn't stall
     scheduleStart(tableId)
   }
 }
@@ -440,13 +440,13 @@ function foldDisconnectedPlayers(tableId: string) {
     setTimeout(() => {
       let s2 = tables.get(tableId)
       if (!s2) return
-      s2 = canStartTable(tableId, s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
-      tables.set(tableId, s2)
-      broadcastTable(tableId)
-      setActionTimer(tableId)
-    }, 2000) // shorter delay when auto-resolved
+      if (canStartTable(tableId, s2)) {
+        s2 = startHand(s2); tables.set(tableId, s2); broadcastTable(tableId); setActionTimer(tableId)
+      } else {
+        tables.set(tableId, { ...s2, street: 'waiting' as any }); broadcastTable(tableId); scheduleStart(tableId)
+      }
+    }, 2000)
   } else {
-    // Recurse — next player might also be disconnected
     setTimeout(() => foldDisconnectedPlayers(tableId), 150)
     setActionTimer(tableId)
   }
@@ -489,8 +489,11 @@ function setActionTimer(tableId: string) {
           setTimeout(() => {
             let s = tables.get(tableId)
             if (!s) return
-            s = canStartTable(tableId, s) ? startHand(s) : { ...s, street: 'waiting' as any }
-            tables.set(tableId, s); broadcastTable(tableId); setActionTimer(tableId)
+            if (canStartTable(tableId, s)) {
+              s = startHand(s); tables.set(tableId, s); broadcastTable(tableId); setActionTimer(tableId)
+            } else {
+              tables.set(tableId, { ...s, street: 'waiting' as any }); broadcastTable(tableId); scheduleStart(tableId)
+            }
           }, 4000)
         } else { setActionTimer(tableId) }
       }, 800)
@@ -532,10 +535,11 @@ function setActionTimer(tableId: string) {
       setTimeout(() => {
         let s = tables.get(tableId)
         if (!s) return
-        s = canStartTable(tableId, s) ? startHand(s) : { ...s, street: 'waiting' as any }
-        tables.set(tableId, s)
-        broadcastTable(tableId)
-        setActionTimer(tableId)
+        if (canStartTable(tableId, s)) {
+          s = startHand(s); tables.set(tableId, s); broadcastTable(tableId); setActionTimer(tableId)
+        } else {
+          tables.set(tableId, { ...s, street: 'waiting' as any }); broadcastTable(tableId); scheduleStart(tableId)
+        }
       }, 4000)
     } else {
       setActionTimer(tableId)
@@ -614,10 +618,11 @@ function runBoardToShowdown(tableId: string): void {
           await new Promise<void>(res => setTimeout(res, 4000))
           let s2 = tables.get(tableId)
           if (!s2) break
-          s2 = canStartTable(tableId, s2) ? startHand(s2) : { ...s2, street: 'waiting' as any }
-          tables.set(tableId, s2)
-          broadcastTable(tableId)
-          setActionTimer(tableId)
+          if (canStartTable(tableId, s2)) {
+            s2 = startHand(s2); tables.set(tableId, s2); broadcastTable(tableId); setActionTimer(tableId)
+          } else {
+            tables.set(tableId, { ...s2, street: 'waiting' as any }); broadcastTable(tableId); scheduleStart(tableId)
+          }
           break
         }
       }
@@ -776,8 +781,22 @@ async function handleJoin(ws: WebSocket, msg: any) {
     state = addPlayer(state, playerId, playerName, reconnectingPlayer.chips, reconnectingPlayer.seatIndex)
     tables.set(tableId, state)
     clients.set(ws, { ws, playerId, playerName, tableId })
+
+    // SF: pre-seeded AFK players connect here — must set playerBanks from DB so saveHandStats has correct bank
+    let bankForMsg = 0
+    if (isSFTable && process.env.DATABASE_URL) {
+      try {
+        const db = getPool()
+        const { rows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [playerId])
+        if (rows[0]) {
+          bankForMsg = rows[0].chips
+          playerBanks.set(`${tableId}:${playerId}`, bankForMsg)
+        }
+      } catch {}
+    }
+
     broadcastTable(tableId)
-    send(ws, { type: 'joined', playerId, tableId, chips: reconnectingPlayer.chips, maxPlayers })
+    send(ws, { type: 'joined', playerId, tableId, chips: reconnectingPlayer.chips, maxPlayers, bank: bankForMsg || undefined })
     console.log(`Player ${playerId} reconnected to ${tableId} with ${reconnectingPlayer.chips} chips`)
     // If a hand is already in progress and no action timer is running, restart it.
     // This fixes the case where resolveHandAfterDisconnect started a hand without a timer.
@@ -915,22 +934,36 @@ async function saveHandStats(state: GameState) {
     const isWinner = winnerIds.has(player.id)
     const wonAmount = state.winners.find(w => w.playerId === player.id)?.amount || 0
 
-    // Total chips = bank (outside table) + current table chips
-    const bankKey = `${state.tableId}:${player.id}`
-    const bank = playerBanks.get(bankKey) ?? 0
-    // SF: play chips are separate from real balance; don't update chips during game
-    const totalChips = isSF ? bank : bank + player.chips
-
-    const { rows: updated } = await db.query(
-      `UPDATE pf_users SET
-        chips        = $1,
-        hands_played = hands_played + 1,
-        hands_won    = hands_won + $2,
-        biggest_pot  = GREATEST(biggest_pot, $3)
-       WHERE tg_id = $4
-       RETURNING hands_played, referred_by, referral_credited, referral_bonus`,
-      [totalChips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]
-    ).catch(() => ({ rows: [] as any[] }))
+    // SF: NEVER update chips column during game — registration deducts, completeSFSession adds prize.
+    // Updating chips here would zero out any player whose playerBanks entry is missing (reconnect bug).
+    let updated: any[]
+    if (isSF) {
+      const r = await db.query(
+        `UPDATE pf_users SET
+          hands_played = hands_played + 1,
+          hands_won    = hands_won + $1,
+          biggest_pot  = GREATEST(biggest_pot, $2)
+         WHERE tg_id = $3
+         RETURNING hands_played, referred_by, referral_credited, referral_bonus`,
+        [isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]
+      ).catch(() => ({ rows: [] as any[] }))
+      updated = r.rows
+    } else {
+      const bankKey = `${state.tableId}:${player.id}`
+      const bank = playerBanks.get(bankKey) ?? 0
+      const totalChips = bank + player.chips
+      const r = await db.query(
+        `UPDATE pf_users SET
+          chips        = $1,
+          hands_played = hands_played + 1,
+          hands_won    = hands_won + $2,
+          biggest_pot  = GREATEST(biggest_pot, $3)
+         WHERE tg_id = $4
+         RETURNING hands_played, referred_by, referral_credited, referral_bonus`,
+        [totalChips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]
+      ).catch(() => ({ rows: [] as any[] }))
+      updated = r.rows
+    }
 
     if (isWinner && wonAmount > 0) {
       await logTransaction(player.id, 'win', wonAmount, `Won hand at table ${state.tableId}`)

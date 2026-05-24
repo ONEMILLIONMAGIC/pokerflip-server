@@ -105,8 +105,22 @@ export async function registerForSF(
     sessionId = ns[0].id
   }
 
-  // Register + deduct buy-in atomically
-  await db.query(`INSERT INTO pf_sf_registrations (session_id, tg_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [sessionId, tgId])
+  // Register + deduct buy-in: only deduct if INSERT actually inserted (RETURNING prevents double-charge on race)
+  const insResult = await db.query(
+    `INSERT INTO pf_sf_registrations (session_id, tg_id) VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING tg_id`,
+    [sessionId, tgId]
+  )
+  if (insResult.rows.length === 0) {
+    // Already registered in this session (race condition) — re-fetch and return
+    const { rows: sRows } = await db.query(
+      `SELECT id, status, prize, table_id,
+       (SELECT COUNT(*) FROM pf_sf_registrations WHERE session_id=pf_sf_sessions.id) AS cnt
+       FROM pf_sf_sessions WHERE id=$1`, [sessionId]
+    )
+    const s = sRows[0]
+    return { sessionId: s.id, playerCount: Number(s.cnt), prize: s.prize, tableId: s.table_id,
+      status: s.status === 'ready' ? 'session_started' : 'already_registered' }
+  }
   await db.query('UPDATE pf_users SET chips = chips - $1 WHERE tg_id=$2', [cfg.buyIn, tgId])
   await logTransaction(tgId, 'sf_entry', -cfg.buyIn, `Spin & Flip entry: ${cfg.name}`)
 
