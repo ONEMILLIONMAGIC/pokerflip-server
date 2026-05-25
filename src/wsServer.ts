@@ -26,6 +26,7 @@ const sfPrizes = new Map<string, number>() // tableId → prize amount
 const afkMode = new Set<string>()
 const sitOutSet = new Set<string>() // tableId:playerId
 const afkRequestTimers = new Map<string, NodeJS.Timeout>() // tableId:playerId → auto-clear timer
+const afkKickTimers = new Map<string, NodeJS.Timeout>() // tableId:playerId → 3-min cash-table kick
 const tableGifts = new Map<string, Map<string, { giftId: string; tint: string; fromName: string }>>() // tableId → targetId → gift
 
 const BOMB_PRICES: Record<string, number> = {
@@ -149,6 +150,49 @@ function clearTableGifts(tableId: string) {
   }
 }
 
+const AFK_KICK_MS = 3 * 60 * 1000 // 3 minutes
+
+function isCashTable(tableId: string) {
+  return !getSFRoomId(tableId) && !TOURNAMENT_TABLE_IDS.has(tableId)
+}
+
+function kickAfkPlayer(tableId: string, playerId: string) {
+  afkKickTimers.delete(`${tableId}:${playerId}`)
+  afkMode.delete(`${tableId}:${playerId}`)
+  const state = tables.get(tableId)
+  if (!state) return
+  const player = state.players.find(p => p.id === playerId)
+  if (!player) return
+  const bank = playerBanks.get(`${tableId}:${playerId}`) ?? 0
+  const total = bank + player.chips
+  if (process.env.DATABASE_URL) {
+    getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [total, playerId]).catch(() => {})
+    if (player.chips > 0) logTransaction(playerId, 'table_leave', player.chips, `AFK kick from ${tableId}`)
+  }
+  playerBanks.delete(`${tableId}:${playerId}`)
+  for (const [ws2, c2] of clients) {
+    if (c2.tableId === tableId && c2.playerId === playerId && ws2.readyState === WebSocket.OPEN)
+      send(ws2, { type: 'afk_kicked' })
+  }
+  removePlayer(state, playerId)
+  tables.set(tableId, state)
+  broadcastTable(tableId)
+  const inHand = state.street !== 'waiting' && state.street !== 'showdown'
+  if (inHand) setTimeout(() => resolveHandAfterDisconnect(tableId), 600)
+}
+
+function scheduleAfkKick(tableId: string, playerId: string) {
+  if (!isCashTable(tableId)) return
+  if (sitOutSet.has(`${tableId}:${playerId}`)) return
+  cancelAfkKick(tableId, playerId)
+  afkKickTimers.set(`${tableId}:${playerId}`, setTimeout(() => kickAfkPlayer(tableId, playerId), AFK_KICK_MS))
+}
+
+function cancelAfkKick(tableId: string, playerId: string) {
+  const t = afkKickTimers.get(`${tableId}:${playerId}`)
+  if (t) { clearTimeout(t); afkKickTimers.delete(`${tableId}:${playerId}`) }
+}
+
 function scheduleNextHand(tableId: string, delay = 4000) {
   setTimeout(() => {
     if (sfEndedTables.has(tableId)) return
@@ -217,6 +261,7 @@ function setActionTimer(tableId: string) {
       if (c2.tableId === tableId && c2.playerId === pp.id && ws2.readyState === WebSocket.OPEN)
         send(ws2, { type: 'you_are_afk' })
     }
+    scheduleAfkKick(tableId, pp.id)
     autoFoldPlayer(tableId, pp.id, true)
   }, ACTION_TIMEOUT_MS))
 }
@@ -470,12 +515,14 @@ function handleMessage(ws: WebSocket, msg: any) {
 
   if (type === 'here') {
     afkMode.delete(`${tableId}:${playerId}`)
+    cancelAfkKick(tableId, playerId)
     send(ws, { type: 'here_ok' })
     return
   }
 
   if (type === 'action') {
     afkMode.delete(`${tableId}:${playerId}`)
+    cancelAfkKick(tableId, playerId)
     const { action, amount } = msg as { action: PlayerAction; amount?: number }
     const state = tables.get(tableId)
     if (!state) return
@@ -567,6 +614,7 @@ function handleMessage(ws: WebSocket, msg: any) {
   if (type === 'sit_out') {
     sitOutSet.add(`${tableId}:${playerId}`)
     afkMode.add(`${tableId}:${playerId}`)
+    cancelAfkKick(tableId, playerId) // voluntary sit-out — no kick
     return
   }
 
@@ -674,6 +722,7 @@ function handleDisconnect(ws: WebSocket) {
 
   afkMode.delete(`${tableId}:${playerId}`)
   sitOutSet.delete(`${tableId}:${playerId}`)
+  cancelAfkKick(tableId, playerId)
   const afkReqTimer = afkRequestTimers.get(`${tableId}:${playerId}`)
   if (afkReqTimer) { clearTimeout(afkReqTimer); afkRequestTimers.delete(`${tableId}:${playerId}`) }
   removePlayer(state, playerId)
@@ -897,6 +946,7 @@ async function checkSFEnd(state: GameState) {
     for (const key of [...afkMode]) { if (key.startsWith(`${tableId}:`)) afkMode.delete(key) }
     for (const key of [...sitOutSet]) { if (key.startsWith(`${tableId}:`)) sitOutSet.delete(key) }
     for (const key of [...afkRequestTimers.keys()]) { if (key.startsWith(`${tableId}:`)) { clearTimeout(afkRequestTimers.get(key)!); afkRequestTimers.delete(key) } }
+    for (const key of [...afkKickTimers.keys()]) { if (key.startsWith(`${tableId}:`)) { clearTimeout(afkKickTimers.get(key)!); afkKickTimers.delete(key) } }
     tableGifts.delete(tableId)
     runoutTables.delete(tableId)
   }, 9000)
