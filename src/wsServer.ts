@@ -127,6 +127,10 @@ function getTableConfig(tableId: string) {
 
 function canStartTable(tableId: string, state: GameState): boolean {
   if (getSFRoomId(tableId)) return state.players.filter(p => p.chips > 0).length >= 2
+  if (isCashTable(tableId)) {
+    // Cash: need 2+ connected players who are not in AFK mode
+    return state.players.filter(p => p.connected && !afkMode.has(`${tableId}:${p.id}`)).length >= 2
+  }
   return canStart(state)
 }
 
@@ -199,7 +203,6 @@ function scheduleNextHand(tableId: string, delay = 4000) {
     const s = tables.get(tableId)
     if (!s) return
     if (canStartTable(tableId, s)) {
-      clearTableGifts(tableId)
       applySFBlindsIfDue(tableId, s)
       if (getSFRoomId(tableId)) startSFHand(s)
       else startHand(s)
@@ -517,6 +520,11 @@ function handleMessage(ws: WebSocket, msg: any) {
     afkMode.delete(`${tableId}:${playerId}`)
     cancelAfkKick(tableId, playerId)
     send(ws, { type: 'here_ok' })
+    // Resume hand if table was paused waiting for this player
+    const stateHere = tables.get(tableId)
+    if (stateHere && stateHere.street === 'waiting' && canStartTable(tableId, stateHere)) {
+      scheduleStart(tableId)
+    }
     return
   }
 
