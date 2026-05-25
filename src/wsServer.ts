@@ -608,6 +608,7 @@ function handleMessage(ws: WebSocket, msg: any) {
     playerBanks.set(bankKey, newBank)
     if (process.env.DATABASE_URL) {
       getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => {})
+      logTransaction(playerId, 'bomb', -price, `💣 Bomb «${bombId}» → ${targetId} at ${tableId}`)
     }
     send(ws, { type: 'bank_update', bank: newBank })
     broadcastToTable(tableId, {
@@ -632,6 +633,7 @@ function handleMessage(ws: WebSocket, msg: any) {
     playerBanks.set(bankKey, newBank)
     if (process.env.DATABASE_URL) {
       getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => {})
+      logTransaction(playerId, 'gift', -price, `🎁 Gift «${giftId}» → ${targetId} at ${tableId}`)
     }
     send(ws, { type: 'bank_update', bank: newBank })
     if (!tableGifts.has(tableId)) tableGifts.set(tableId, new Map())
