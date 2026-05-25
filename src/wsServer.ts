@@ -76,6 +76,33 @@ setInterval(() => {
   }
 }, 5000)
 
+// ─── SF helpers ───────────────────────────────────────────────────────────────
+
+// Bump SF blinds if their 3-minute timer has expired
+function applySFBlindsIfDue(tableId: string, state: GameState): void {
+  if (!tableId.startsWith('sf_')) return
+  const bs = sfBlinds.get(tableId)
+  if (!bs || Date.now() < bs.nextAt) return
+  bs.level++
+  bs.sb *= 2
+  bs.bb *= 2
+  bs.nextAt = Date.now() + 3 * 60_000
+  sfBlindPendingNotified.delete(tableId)
+  state.smallBlind = bs.sb
+  state.bigBlind = bs.bb
+  state.minRaise = bs.bb
+  broadcastToTable(tableId, { type: 'blind_increase', level: bs.level, sb: bs.sb, bb: bs.bb })
+}
+
+// Start hand in SF mode: temporarily mark all chipped players as connected
+// so startHand deals cards to them — they'll be auto-folded by the action timer.
+function startSFHand(state: GameState): void {
+  const saved = new Map(state.players.map(p => [p.id, p.connected]))
+  state.players.forEach(p => { if (p.chips > 0) p.connected = true })
+  startHand(state)
+  state.players.forEach(p => { p.connected = saved.get(p.id) ?? false })
+}
+
 // ─── Core helpers ─────────────────────────────────────────────────────────────
 
 function getTableConfig(tableId: string) {
@@ -106,7 +133,9 @@ function scheduleNextHand(tableId: string, delay = 4000) {
     const s = tables.get(tableId)
     if (!s) return
     if (canStartTable(tableId, s)) {
-      startHand(s)
+      applySFBlindsIfDue(tableId, s)
+      if (getSFRoomId(tableId)) startSFHand(s)
+      else startHand(s)
       tables.set(tableId, s)
       broadcastTable(tableId)
       setActionTimer(tableId)
@@ -301,7 +330,9 @@ function runBoardToShowdown(tableId: string): void {
           if (!s2) break
           if (!sfEndedTables.has(tableId)) {
             if (canStartTable(tableId, s2)) {
-              startHand(s2)
+              applySFBlindsIfDue(tableId, s2)
+              if (getSFRoomId(tableId)) startSFHand(s2)
+              else startHand(s2)
               tables.set(tableId, s2)
               broadcastTable(tableId)
               setActionTimer(tableId)
@@ -344,23 +375,13 @@ function scheduleStart(tableId: string) {
         const cfg = getTableConfig(tableId)
         sfBlinds.set(tableId, { level: 0, sb: cfg.sb, bb: cfg.bb, nextAt: Date.now() + 3 * 60_000 })
       }
+      applySFBlindsIfDue(tableId, state)
       const bs = sfBlinds.get(tableId)!
-      if (Date.now() >= bs.nextAt) {
-        bs.level++
-        bs.sb *= 2
-        bs.bb *= 2
-        bs.nextAt = Date.now() + 3 * 60_000
-        sfBlindPendingNotified.delete(tableId)
-        state.smallBlind = bs.sb
-        state.bigBlind = bs.bb
-        state.minRaise = bs.bb
-        tables.set(tableId, state)
-        broadcastToTable(tableId, { type: 'blind_increase', level: bs.level, sb: bs.sb, bb: bs.bb })
-      }
       broadcastToTable(tableId, { type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb, nextLevelAt: bs.nextAt })
     }
 
-    startHand(state)
+    if (getSFRoomId(tableId)) startSFHand(state)
+    else startHand(state)
     tables.set(tableId, state)
     broadcastTable(tableId)
     setActionTimer(tableId)
