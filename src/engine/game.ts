@@ -9,13 +9,13 @@ export interface Player {
   name: string
   chips: number
   holeCards: Card[]
-  bet: number       // current street bet
-  totalBet: number  // total invested this hand
+  bet: number
+  totalBet: number
   folded: boolean
   allIn: boolean
   connected: boolean
   seatIndex: number
-  hasActed: boolean // has voluntarily acted this street
+  hasActed: boolean
 }
 
 export interface GameState {
@@ -26,10 +26,11 @@ export interface GameState {
   street: Street
   pot: number
   sidePots: { amount: number; eligible: string[] }[]
-  currentBet: number  // highest bet on street
+  currentBet: number
   minRaise: number
   dealerIdx: number
-  actionIdx: number   // who acts next
+  actionIdx: number
+  bbIdx: number
   smallBlind: number
   bigBlind: number
   lastActionTime: number
@@ -41,7 +42,7 @@ export function createTable(tableId: string, sb = 10, bb = 20): GameState {
     tableId, players: [], deck: [], board: [],
     street: 'waiting', pot: 0, sidePots: [],
     currentBet: 0, minRaise: bb,
-    dealerIdx: 0, actionIdx: 0,
+    dealerIdx: 0, actionIdx: 0, bbIdx: 0,
     smallBlind: sb, bigBlind: bb,
     lastActionTime: Date.now(), winners: [],
   }
@@ -51,23 +52,24 @@ export function canStart(state: GameState): boolean {
   return state.players.filter(p => p.connected && p.chips > 0).length >= 2
 }
 
+// All mutations happen in-place; functions return the same reference.
+// Only maskForPlayer (view generation) deep-clones, never the hot path.
+
 export function startHand(state: GameState): GameState {
-  const s = deepClone(state)
-  const activePlayers = s.players.filter(p => p.connected && p.chips > 0)
-  if (activePlayers.length < 2) return s
+  const activePlayers = state.players.filter(p => p.connected && p.chips > 0)
+  if (activePlayers.length < 2) return state
 
-  // Reset hand state
-  s.deck = shuffle(makeDeck())
-  s.board = []
-  s.pot = 0
-  s.sidePots = []
-  s.currentBet = s.bigBlind
-  s.minRaise = s.bigBlind
-  s.winners = []
-  s.street = 'preflop'
-  s.lastActionTime = Date.now()
+  state.deck = shuffle(makeDeck())
+  state.board = []
+  state.pot = 0
+  state.sidePots = []
+  state.currentBet = state.bigBlind
+  state.minRaise = state.bigBlind
+  state.winners = []
+  state.street = 'preflop'
+  state.lastActionTime = Date.now()
 
-  for (const p of s.players) {
+  for (const p of state.players) {
     p.holeCards = []
     p.bet = 0
     p.totalBet = 0
@@ -76,25 +78,22 @@ export function startHand(state: GameState): GameState {
     p.hasActed = false
   }
 
-  // Move dealer button (skip broke/disconnected)
-  s.dealerIdx = nextActiveIdx(s, s.dealerIdx)
+  state.dealerIdx = nextActiveIdx(state, state.dealerIdx)
 
-  // Deal 2 cards to each active player
-  for (const p of s.players.filter(p => !p.folded)) {
-    p.holeCards = [s.deck.pop()!, s.deck.pop()!]
+  for (const p of state.players.filter(p => !p.folded)) {
+    p.holeCards = [state.deck.pop()!, state.deck.pop()!]
   }
 
-  // Post blinds
-  const sbIdx = nextActiveIdx(s, s.dealerIdx)
-  const bbIdx = nextActiveIdx(s, sbIdx)
+  const sbIdx = nextActiveIdx(state, state.dealerIdx)
+  const bbIdx = nextActiveIdx(state, sbIdx)
 
-  postBlind(s, sbIdx, s.smallBlind)
-  postBlind(s, bbIdx, s.bigBlind)
+  postBlind(state, sbIdx, state.smallBlind)
+  postBlind(state, bbIdx, state.bigBlind)
 
-  // Action starts left of BB
-  s.actionIdx = nextActiveIdx(s, bbIdx)
+  state.bbIdx = bbIdx
+  state.actionIdx = nextActiveIdx(state, bbIdx)
 
-  return s
+  return state
 }
 
 function postBlind(s: GameState, idx: number, amount: number) {
@@ -109,11 +108,10 @@ function postBlind(s: GameState, idx: number, amount: number) {
 }
 
 export function applyAction(state: GameState, playerId: string, action: PlayerAction, amount = 0): GameState {
-  const s = deepClone(state)
-  const p = s.players[s.actionIdx]
-  if (!p || p.id !== playerId || p.folded || p.allIn) return s
+  const p = state.players[state.actionIdx]
+  if (!p || p.id !== playerId || p.folded || p.allIn) return state
 
-  const toCall = s.currentBet - p.bet
+  const toCall = state.currentBet - p.bet
 
   switch (action) {
     case 'fold':
@@ -121,7 +119,7 @@ export function applyAction(state: GameState, playerId: string, action: PlayerAc
       break
 
     case 'check':
-      if (toCall > 0) return s // can't check
+      if (toCall > 0) return state
       break
 
     case 'call': {
@@ -129,7 +127,7 @@ export function applyAction(state: GameState, playerId: string, action: PlayerAc
       p.chips -= callAmt
       p.bet += callAmt
       p.totalBet += callAmt
-      s.pot += callAmt
+      state.pot += callAmt
       if (p.chips === 0) p.allIn = true
       break
     }
@@ -137,40 +135,41 @@ export function applyAction(state: GameState, playerId: string, action: PlayerAc
     case 'raise':
     case 'allin': {
       const raiseAmt = action === 'allin' ? p.chips : Math.min(amount, p.chips)
-      if (raiseAmt < s.minRaise && p.chips > raiseAmt) return s // invalid raise
+      if (raiseAmt < state.minRaise && p.chips > raiseAmt) return state
       const newBet = p.bet + raiseAmt
-      s.minRaise = Math.max(s.minRaise, newBet - s.currentBet)
-      s.currentBet = Math.max(s.currentBet, newBet)
+      state.minRaise = Math.max(state.minRaise, newBet - state.currentBet)
+      state.currentBet = Math.max(state.currentBet, newBet)
       p.chips -= raiseAmt
       p.bet += raiseAmt
       p.totalBet += raiseAmt
-      s.pot += raiseAmt
+      state.pot += raiseAmt
       if (p.chips === 0) p.allIn = true
       break
     }
   }
 
   p.hasActed = true
-  s.lastActionTime = Date.now()
+  state.lastActionTime = Date.now()
 
-  // Check if street is over
-  if (isStreetOver(s)) {
-    return advanceStreet(s)
+  if (isStreetOver(state)) {
+    return advanceStreet(state)
   }
 
-  s.actionIdx = nextActiveIdx(s, s.actionIdx)
-  return s
+  state.actionIdx = nextActiveIdx(state, state.actionIdx)
+  return state
 }
 
 function isStreetOver(s: GameState): boolean {
-  const active = s.players.filter(p => !p.folded && !p.allIn)
+  const notFolded = s.players.filter(p => !p.folded)
+  if (notFolded.length <= 1) return true
+
+  const active = notFolded.filter(p => !p.allIn)
   if (active.length === 0) return true
-  // All active players have matched the current bet AND had a chance to act
+
   return active.every(p => p.hasActed && p.bet === s.currentBet)
 }
 
 export function advanceStreet(s: GameState): GameState {
-  // Reset bets and acted flags for new street
   for (const p of s.players) { p.bet = 0; p.hasActed = false }
   s.currentBet = 0
   s.minRaise = s.bigBlind
@@ -178,7 +177,6 @@ export function advanceStreet(s: GameState): GameState {
   const notFolded = s.players.filter(p => !p.folded)
 
   if (notFolded.length === 1) {
-    // Everyone else folded — winner takes pot
     s.winners = [{ playerId: notFolded[0].id, amount: s.pot, hand: 'Last standing' }]
     notFolded[0].chips += s.pot
     s.pot = 0
@@ -188,15 +186,15 @@ export function advanceStreet(s: GameState): GameState {
 
   switch (s.street) {
     case 'preflop':
-      s.board.push(s.deck.pop()!, s.deck.pop()!, s.deck.pop()!) // flop
+      s.board.push(s.deck.pop()!, s.deck.pop()!, s.deck.pop()!)
       s.street = 'flop'
       break
     case 'flop':
-      s.board.push(s.deck.pop()!) // turn
+      s.board.push(s.deck.pop()!)
       s.street = 'turn'
       break
     case 'turn':
-      s.board.push(s.deck.pop()!) // river
+      s.board.push(s.deck.pop()!)
       s.street = 'river'
       break
     case 'river':
@@ -204,12 +202,10 @@ export function advanceStreet(s: GameState): GameState {
       return resolveShowdown(s)
   }
 
-  // Action starts from first active player left of dealer
   s.actionIdx = nextActiveIdx(s, s.dealerIdx)
   return s
 }
 
-// Build side pots from players' total bets (including folded contributors)
 function calculatePots(players: Player[]): { amount: number; eligible: string[] }[] {
   const contributors = players.filter(p => p.totalBet > 0)
   if (contributors.length === 0) return []
@@ -236,11 +232,6 @@ function resolveShowdown(s: GameState): GameState {
     const hole = p.holeCards.map(c => `${c.rank}${c.suit}`).join(' ')
     const r = evaluate([...p.holeCards, ...s.board])
     console.log(`[Showdown] ${p.name}: hole=[${hole}] board=[${boardStr}] → ${r.name} (score=${r.score})`)
-  }
-  for (const p of s.players.filter(p => p.folded && p.holeCards.length > 0)) {
-    const hole = p.holeCards.map(c => `${c.rank}${c.suit}`).join(' ')
-    const ev = evaluate([...p.holeCards, ...s.board])
-    console.log(`[Showdown] ${p.name} (FOLDED): hole=[${hole}] board=[${boardStr}] → would have had ${ev.name} (score=${ev.score})`)
   }
 
   const pots = calculatePots(s.players)
@@ -289,45 +280,35 @@ function resolveShowdown(s: GameState): GameState {
 
 function nextActiveIdx(s: GameState, fromIdx: number): number {
   const n = s.players.length
-  let idx = (fromIdx + 1) % n
-  let tries = 0
-  while (tries < n) {
+  for (let i = 1; i <= n; i++) {
+    const idx = (fromIdx + i) % n
     const p = s.players[idx]
     if (p && !p.folded && !p.allIn && p.chips > 0) return idx
-    idx = (idx + 1) % n
-    tries++
   }
   return fromIdx
 }
 
-function deepClone<T>(obj: T): T { return JSON.parse(JSON.stringify(obj)) }
-
 export function addPlayer(state: GameState, id: string, name: string, chips: number, seat: number): GameState {
-  const s = deepClone(state)
-  const existing = s.players.find(p => p.id === id)
-  if (existing) { existing.connected = true; return s }
-  s.players.push({ id, name, chips, holeCards: [], bet: 0, totalBet: 0, folded: false, allIn: false, connected: true, seatIndex: seat, hasActed: false })
-  s.players.sort((a, b) => a.seatIndex - b.seatIndex)
-  return s
+  const existing = state.players.find(p => p.id === id)
+  if (existing) { existing.connected = true; return state }
+  state.players.push({ id, name, chips, holeCards: [], bet: 0, totalBet: 0, folded: false, allIn: false, connected: true, seatIndex: seat, hasActed: false })
+  state.players.sort((a, b) => a.seatIndex - b.seatIndex)
+  return state
 }
 
 export function removePlayer(state: GameState, id: string): GameState {
-  const s = deepClone(state)
-  const p = s.players.find(p => p.id === id)
+  const p = state.players.find(p => p.id === id)
   if (p) p.connected = false
-  return s
+  return state
 }
 
-// Mask hole cards for a specific viewer (hide opponent cards)
 export function maskForPlayer(state: GameState, viewerId: string): GameState {
-  const s = deepClone(state)
-  // All-in players show cards if no more betting action is possible
+  const s = structuredClone(state)
   const activeBettors = s.players.filter(p => !p.folded && !p.allIn)
-  const allInShowdown = activeBettors.length <= 1 // all remaining are all-in → show cards
+  const allInShowdown = activeBettors.length <= 1
 
   for (const p of s.players) {
     if (p.id !== viewerId && s.street !== 'showdown') {
-      // Keep cards visible if player is all-in and board is being run out
       if (p.allIn && allInShowdown) continue
       p.holeCards = p.holeCards.map(() => ({ rank: '?', suit: '?' } as any))
     }
