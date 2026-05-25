@@ -22,6 +22,7 @@ const runoutTables = new Set<string>()
 const sfBlinds = new Map<string, { level: number; sb: number; bb: number; nextAt: number }>()
 const sfBlindPendingNotified = new Set<string>()
 const sfEndedTables = new Set<string>()
+const sfPrizes = new Map<string, number>() // tableId → prize amount
 const afkMode = new Set<string>()
 
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
@@ -394,10 +395,13 @@ function scheduleStart(tableId: string) {
 function broadcastTable(tableId: string) {
   const state = tables.get(tableId)
   if (!state) return
+  const sfPrize = sfPrizes.get(tableId)
   for (const [ws, client] of clients) {
     if (client.tableId !== tableId) continue
     if (ws.readyState !== WebSocket.OPEN) continue
-    send(ws, { type: 'state', state: maskForPlayer(state, client.playerId) })
+    const msg: any = { type: 'state', state: maskForPlayer(state, client.playerId) }
+    if (sfPrize !== undefined) msg.sfPrize = sfPrize
+    send(ws, msg)
   }
 }
 
@@ -677,7 +681,10 @@ async function handleJoin(ws: WebSocket, msg: any) {
           sessionId ? db.query('SELECT prize FROM pf_sf_sessions WHERE id=$1', [sessionId]) : Promise.resolve(null),
         ])
         if (bankRes.rows[0]) { bankForMsg = bankRes.rows[0].chips; playerBanks.set(`${tableId}:${playerId}`, bankForMsg) }
-        if (prizeRes?.rows[0]) broadcastToTable(tableId, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) })
+        if (prizeRes?.rows[0]) {
+          sfPrizes.set(tableId, prizeRes.rows[0].prize)
+          broadcastToTable(tableId, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) })
+        }
       } catch {}
     }
 
@@ -722,7 +729,10 @@ async function handleJoin(ws: WebSocket, msg: any) {
                   WHERE r.session_id=$1`, [sessionId]),
       ]).catch(() => [null, null] as any)
 
-      if (prizeRes?.rows[0]) broadcastToTable(tableId, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) })
+      if (prizeRes?.rows[0]) {
+        sfPrizes.set(tableId, prizeRes.rows[0].prize)
+        broadcastToTable(tableId, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) })
+      }
 
       if (regRes?.rows) {
         for (const reg of regRes.rows) {
@@ -772,6 +782,7 @@ async function checkSFEnd(state: GameState) {
   setTimeout(() => {
     tables.delete(tableId)
     sfBlinds.delete(tableId)
+    sfPrizes.delete(tableId)
     sfEndedTables.delete(tableId)
     clearActionTimer(tableId)
     const st = startTimers.get(tableId)
