@@ -670,8 +670,14 @@ async function handleJoin(ws: WebSocket, msg: any) {
     let bankForMsg = 0
     if (isSFTable && process.env.DATABASE_URL) {
       try {
-        const { rows } = await getPool().query('SELECT chips FROM pf_users WHERE tg_id=$1', [playerId])
-        if (rows[0]) { bankForMsg = rows[0].chips; playerBanks.set(`${tableId}:${playerId}`, bankForMsg) }
+        const db = getPool()
+        const sessionId = tableId.match(/_(\d+)$/)?.[1]
+        const [bankRes, prizeRes] = await Promise.all([
+          db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [playerId]),
+          sessionId ? db.query('SELECT prize FROM pf_sf_sessions WHERE id=$1', [sessionId]) : Promise.resolve(null),
+        ])
+        if (bankRes.rows[0]) { bankForMsg = bankRes.rows[0].chips; playerBanks.set(`${tableId}:${playerId}`, bankForMsg) }
+        if (prizeRes?.rows[0]) broadcastToTable(tableId, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) })
       } catch {}
     }
 
@@ -716,7 +722,7 @@ async function handleJoin(ws: WebSocket, msg: any) {
                   WHERE r.session_id=$1`, [sessionId]),
       ]).catch(() => [null, null] as any)
 
-      if (prizeRes?.rows[0]) send(ws, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) })
+      if (prizeRes?.rows[0]) broadcastToTable(tableId, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) })
 
       if (regRes?.rows) {
         for (const reg of regRes.rows) {
