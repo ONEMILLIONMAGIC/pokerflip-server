@@ -30,14 +30,14 @@ const afkKickTimers = new Map<string, NodeJS.Timeout>() // tableId:playerId → 
 const tableGifts = new Map<string, Map<string, { giftId: string; tint: string; fromName: string }>>() // tableId → targetId → gift
 
 const BOMB_PRICES: Record<string, number> = {
-  tomato: 50, banana: 100, egg: 100, ice: 200, fish: 250,
+  tomato: 50, banana: 100, egg: 100, poop: 200, fish: 250,
   pie: 300, brick: 500, cactus: 750, skull: 1000, bomb: 2500,
 }
 const GIFT_PRICES: Record<string, number> = {
   rose: 100, heart: 200, cake: 300, cocktail: 400, cigar: 500,
-  shades: 600, lightning: 750, fire: 800, star: 1000, champagne: 1500,
-  cards: 1800, money: 2500, chips: 3000, rocket: 5000, watch: 7500,
-  ring: 10000, trophy: 15000, diamond: 25000, ace_pendant: 50000, crown: 100000,
+  shades: 600, champagne: 1500, money: 2500,
+  rocket: 5000, watch: 7500, ring: 10000,
+  trophy: 15000, diamond: 25000, ace_pendant: 50000, crown: 100000,
 }
 
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
