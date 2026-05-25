@@ -10,43 +10,61 @@ const tables = new Map();
 const clients = new Map();
 const startTimers = new Map();
 const actionTimers = new Map();
-const afkTimers = new Map(); // key: tableId:playerId
-const playerBanks = new Map(); // key: tableId:playerId → chips left in bank (DB - buyIn)
-const runoutTables = new Set(); // tables currently in all-in board runout
-// SF blind level: doubles every 3 minutes
+const afkTimers = new Map();
+const playerBanks = new Map();
+const runoutTables = new Set();
 const sfBlinds = new Map();
-// SF sessions that have already ended — guard against double-completion and stale hand starts
+const sfBlindPendingNotified = new Set();
 const sfEndedTables = new Set();
-// Connected players in AFK mode (timed out) — auto-fold quickly on next turn
-const afkMode = new Set(); // key: tableId:playerId
+const sfPrizes = new Map(); // tableId → prize amount
+const afkMode = new Set();
+const sitOutSet = new Set(); // tableId:playerId
+const afkRequestTimers = new Map(); // tableId:playerId → auto-clear timer
+const tableGifts = new Map(); // tableId → targetId → gift
+const BOMB_PRICES = {
+    tomato: 50, banana: 100, egg: 100, ice: 200, fish: 250,
+    pie: 300, brick: 500, cactus: 750, skull: 1000, bomb: 2500,
+};
+const GIFT_PRICES = {
+    rose: 100, heart: 200, cake: 300, cocktail: 400, cigar: 500,
+    shades: 600, lightning: 750, fire: 800, star: 1000, champagne: 1500,
+    cards: 1800, money: 2500, chips: 3000, rocket: 5000, watch: 7500,
+    ring: 10000, trophy: 15000, diamond: 25000, ace_pendant: 50000, crown: 100000,
+};
 const TABLE_CONFIG = {
-    // NL Hold'em
     main: { sb: 10, bb: 20, minBuyIn: 400 },
     shadow: { sb: 25, bb: 50, minBuyIn: 1000 },
     crimson: { sb: 50, bb: 100, minBuyIn: 2000 },
     obsidian: { sb: 100, bb: 200, minBuyIn: 5000 },
-    // Limit Hold'em
     limit1: { sb: 10, bb: 20, minBuyIn: 400 },
     limit2: { sb: 25, bb: 50, minBuyIn: 1000 },
     limit3: { sb: 50, bb: 100, minBuyIn: 2000 },
     limit4: { sb: 100, bb: 200, minBuyIn: 5000 },
-    // 1v1 Heads Up
     heads1: { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
     heads2: { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
     heads3: { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
     heads4: { sb: 25, bb: 50, minBuyIn: 1000, maxPlayers: 2 },
-    // Tournaments
     daily: { sb: 50, bb: 100, minBuyIn: 2000 },
     weekly: { sb: 100, bb: 200, minBuyIn: 5000 },
 };
 const ACTION_TIMEOUT_MS = 30000;
-// SF blind status broadcast: every 5s push current level + time-to-next to all SF tables
+const TOURNAMENT_TABLE_IDS = new Set(['daily', 'weekly']);
+// ─── Interval Watchers ────────────────────────────────────────────────────────
 setInterval(() => {
     for (const [tableId, bs] of sfBlinds) {
-        broadcastToTable(tableId, { type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb, nextLevelAt: bs.nextAt });
+        const state = tables.get(tableId);
+        const inHand = state && state.street !== 'waiting' && state.street !== 'showdown';
+        const isPending = Date.now() >= bs.nextAt;
+        broadcastToTable(tableId, {
+            type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb,
+            nextLevelAt: bs.nextAt, blindsPending: isPending && !!inHand
+        });
+        if (isPending && inHand && !sfBlindPendingNotified.has(tableId)) {
+            sfBlindPendingNotified.add(tableId);
+            broadcastToTable(tableId, { type: 'blind_pending_increase', nextSb: bs.sb * 2, nextBb: bs.bb * 2 });
+        }
     }
 }, 5000);
-// Safety watchdog: every 5s scan all tables for stuck all-in states
 setInterval(() => {
     for (const [tableId, state] of tables) {
         if (state.street === 'waiting' || state.street === 'showdown')
@@ -54,22 +72,386 @@ setInterval(() => {
         if (runoutTables.has(tableId))
             continue;
         if (actionTimers.has(tableId))
-            continue; // normal action timer is running
+            continue;
         if (canAutoRunBoard(state)) {
-            console.log(`[Watchdog] ${tableId}: stuck board at ${state.street}, triggering runout`);
+            console.log(`[Watchdog] ${tableId}: stuck all-in at ${state.street}, triggering runout`);
             runBoardToShowdown(tableId);
+        }
+        else {
+            console.log(`[Watchdog] ${tableId}: no action timer at ${state.street}, restarting`);
+            setActionTimer(tableId);
         }
     }
 }, 5000);
+// ─── SF helpers ───────────────────────────────────────────────────────────────
+// Bump SF blinds if their 3-minute timer has expired
+function applySFBlindsIfDue(tableId, state) {
+    if (!tableId.startsWith('sf_'))
+        return;
+    const bs = sfBlinds.get(tableId);
+    if (!bs || Date.now() < bs.nextAt)
+        return;
+    bs.level++;
+    bs.sb *= 2;
+    bs.bb *= 2;
+    bs.nextAt = Date.now() + 3 * 60000;
+    sfBlindPendingNotified.delete(tableId);
+    state.smallBlind = bs.sb;
+    state.bigBlind = bs.bb;
+    state.minRaise = bs.bb;
+    broadcastToTable(tableId, { type: 'blind_increase', level: bs.level, sb: bs.sb, bb: bs.bb });
+}
+// Start hand in SF mode: temporarily mark all chipped players as connected
+// so startHand deals cards to them — they'll be auto-folded by the action timer.
+function startSFHand(state) {
+    const saved = new Map(state.players.map(p => [p.id, p.connected]));
+    state.players.forEach(p => { if (p.chips > 0)
+        p.connected = true; });
+    (0, game_1.startHand)(state);
+    state.players.forEach(p => { p.connected = saved.get(p.id) ?? false; });
+}
+// ─── Core helpers ─────────────────────────────────────────────────────────────
+function getTableConfig(tableId) {
+    return TABLE_CONFIG[tableId] || (0, spinFlip_1.getSFTableConfig)(tableId) || TABLE_CONFIG.main;
+}
+function canStartTable(tableId, state) {
+    if ((0, spinFlip_1.getSFRoomId)(tableId))
+        return state.players.filter(p => p.chips > 0).length >= 2;
+    return (0, game_1.canStart)(state);
+}
+function canAutoRunBoard(state) {
+    if (state.street === 'showdown' || state.street === 'waiting')
+        return false;
+    const activePlayers = state.players.filter(p => !p.folded && !p.allIn);
+    if (activePlayers.length === 0)
+        return true;
+    return activePlayers.every(p => {
+        const toCall = Math.max(0, state.currentBet - p.bet);
+        if (toCall > 0)
+            return false;
+        return !state.players.some(pp => !pp.folded && !pp.allIn && pp.id !== p.id);
+    });
+}
+// ─── Single post-showdown scheduler (replaces 4+ duplicate blocks) ────────────
+function clearTableGifts(tableId) {
+    if (tableGifts.has(tableId)) {
+        tableGifts.delete(tableId);
+        broadcastToTable(tableId, { type: 'gift_clear' });
+    }
+}
+function scheduleNextHand(tableId, delay = 4000) {
+    setTimeout(() => {
+        if (sfEndedTables.has(tableId))
+            return;
+        const s = tables.get(tableId);
+        if (!s)
+            return;
+        if (canStartTable(tableId, s)) {
+            clearTableGifts(tableId);
+            applySFBlindsIfDue(tableId, s);
+            if ((0, spinFlip_1.getSFRoomId)(tableId))
+                startSFHand(s);
+            else
+                (0, game_1.startHand)(s);
+            tables.set(tableId, s);
+            broadcastTable(tableId);
+            setActionTimer(tableId);
+        }
+        else {
+            s.street = 'waiting';
+            tables.set(tableId, s);
+            broadcastTable(tableId);
+            scheduleStart(tableId);
+        }
+    }, delay);
+}
+// ─── Timer management ─────────────────────────────────────────────────────────
+function clearActionTimer(tableId) {
+    const t = actionTimers.get(tableId);
+    if (t) {
+        clearTimeout(t);
+        actionTimers.delete(tableId);
+    }
+}
+function setActionTimer(tableId) {
+    clearActionTimer(tableId);
+    if (runoutTables.has(tableId))
+        return;
+    const state = tables.get(tableId);
+    if (!state)
+        return;
+    if (canAutoRunBoard(state)) {
+        runBoardToShowdown(tableId);
+        return;
+    }
+    const p = state.players[state.actionIdx];
+    if (!p || p.folded || p.allIn)
+        return;
+    // Disconnected player — fold quickly
+    if (!p.connected) {
+        actionTimers.set(tableId, setTimeout(() => foldDisconnectedPlayers(tableId), 800));
+        return;
+    }
+    // AFK player — instant fold
+    if (afkMode.has(`${tableId}:${p.id}`)) {
+        actionTimers.set(tableId, setTimeout(() => autoFoldPlayer(tableId, p.id, false), 800));
+        return;
+    }
+    // Normal timer
+    actionTimers.set(tableId, setTimeout(() => {
+        const st = tables.get(tableId);
+        if (!st || st.street === 'waiting' || st.street === 'showdown')
+            return;
+        if (canAutoRunBoard(st)) {
+            runBoardToShowdown(tableId);
+            return;
+        }
+        const pp = st.players[st.actionIdx];
+        if (!pp || pp.folded || pp.allIn) {
+            setActionTimer(tableId);
+            return;
+        }
+        afkMode.add(`${tableId}:${pp.id}`);
+        for (const [ws2, c2] of clients) {
+            if (c2.tableId === tableId && c2.playerId === pp.id && ws2.readyState === ws_1.WebSocket.OPEN)
+                send(ws2, { type: 'you_are_afk' });
+        }
+        autoFoldPlayer(tableId, pp.id, true);
+    }, ACTION_TIMEOUT_MS));
+}
+function autoFoldPlayer(tableId, playerId, isTimed) {
+    let st = tables.get(tableId);
+    if (!st || st.street === 'waiting' || st.street === 'showdown')
+        return;
+    if (canAutoRunBoard(st)) {
+        runBoardToShowdown(tableId);
+        return;
+    }
+    const pp = st.players[st.actionIdx];
+    if (!pp || pp.id !== playerId || pp.folded || pp.allIn) {
+        setActionTimer(tableId);
+        return;
+    }
+    (0, game_1.applyAction)(st, playerId, 'fold');
+    tables.set(tableId, st);
+    broadcastTable(tableId);
+    st = tables.get(tableId);
+    if (st.street === 'showdown') {
+        saveHandStats(st).catch(console.error);
+        scheduleNextHand(tableId, isTimed ? 4000 : 2000);
+    }
+    else {
+        setActionTimer(tableId);
+    }
+}
+// ─── Disconnect helpers ────────────────────────────────────────────────────────
+function foldDisconnectedPlayers(tableId) {
+    let s = tables.get(tableId);
+    if (!s || s.street === 'waiting' || s.street === 'showdown')
+        return;
+    const p = s.players[s.actionIdx];
+    if (!p || p.folded || p.allIn)
+        return;
+    if (p.connected)
+        return;
+    clearActionTimer(tableId);
+    (0, game_1.applyAction)(s, p.id, 'fold');
+    tables.set(tableId, s);
+    broadcastTable(tableId);
+    s = tables.get(tableId);
+    if (s.street === 'showdown') {
+        saveHandStats(s).catch(console.error);
+        scheduleNextHand(tableId, 2000);
+    }
+    else {
+        setTimeout(() => foldDisconnectedPlayers(tableId), 150);
+        setActionTimer(tableId);
+    }
+}
+function resolveHandAfterDisconnect(tableId) {
+    const s = tables.get(tableId);
+    if (!s || s.street === 'waiting' || s.street === 'showdown')
+        return;
+    if (canAutoRunBoard(s)) {
+        if (!runoutTables.has(tableId))
+            runBoardToShowdown(tableId);
+        return;
+    }
+    const canAct = s.players.filter(p => p.connected && !p.folded && !p.allIn);
+    if (canAct.length > 0) {
+        foldDisconnectedPlayers(tableId);
+        return;
+    }
+    clearActionTimer(tableId);
+    // Fold all disconnected active players
+    for (const p of s.players) {
+        if (!p.connected && !p.folded && !p.allIn) {
+            p.folded = true;
+            p.hasActed = true;
+        }
+    }
+    const notFolded = s.players.filter(p => !p.folded);
+    if (notFolded.length === 1) {
+        const winner = notFolded[0];
+        winner.chips += s.pot;
+        s.winners = [{ playerId: winner.id, amount: s.pot, hand: 'Last standing' }];
+        s.pot = 0;
+        s.street = 'showdown';
+        tables.set(tableId, s);
+        broadcastTable(tableId);
+        saveHandStats(s).catch(console.error);
+        scheduleNextHand(tableId, 2000);
+    }
+    else if (notFolded.length > 1) {
+        tables.set(tableId, s);
+        broadcastTable(tableId);
+        runBoardToShowdown(tableId);
+    }
+    else {
+        // Everyone folded — return bets
+        for (const p of s.players) {
+            p.chips += p.bet ?? 0;
+            p.bet = 0;
+            p.totalBet = 0;
+        }
+        s.pot = 0;
+        s.street = 'waiting';
+        tables.set(tableId, s);
+        broadcastTable(tableId);
+        scheduleStart(tableId);
+    }
+}
+// ─── Board auto-runout ────────────────────────────────────────────────────────
+function runBoardToShowdown(tableId) {
+    if (runoutTables.has(tableId))
+        return;
+    const s = tables.get(tableId);
+    if (!s || !canAutoRunBoard(s)) {
+        if (s && !canAutoRunBoard(s))
+            setActionTimer(tableId);
+        return;
+    }
+    runoutTables.add(tableId);
+    clearActionTimer(tableId);
+    async function loop() {
+        try {
+            while (true) {
+                await new Promise(res => setTimeout(res, 1000));
+                const state = tables.get(tableId);
+                if (!state || state.street === 'showdown' || state.street === 'waiting')
+                    break;
+                if (!canAutoRunBoard(state)) {
+                    setActionTimer(tableId);
+                    return;
+                }
+                (0, game_1.advanceStreet)(state);
+                tables.set(tableId, state);
+                broadcastTable(tableId);
+                const afterAdvance = tables.get(tableId);
+                if (afterAdvance.street === 'showdown') {
+                    saveHandStats(state).catch(console.error);
+                    await new Promise(res => setTimeout(res, 4000));
+                    const s2 = tables.get(tableId);
+                    if (!s2)
+                        break;
+                    if (!sfEndedTables.has(tableId)) {
+                        if (canStartTable(tableId, s2)) {
+                            applySFBlindsIfDue(tableId, s2);
+                            if ((0, spinFlip_1.getSFRoomId)(tableId))
+                                startSFHand(s2);
+                            else
+                                (0, game_1.startHand)(s2);
+                            tables.set(tableId, s2);
+                            broadcastTable(tableId);
+                            setActionTimer(tableId);
+                        }
+                        else {
+                            s2.street = 'waiting';
+                            tables.set(tableId, s2);
+                            broadcastTable(tableId);
+                            scheduleStart(tableId);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        finally {
+            runoutTables.delete(tableId);
+        }
+    }
+    loop().catch(e => {
+        runoutTables.delete(tableId);
+        console.error(`[RunBoard] ${tableId}: error`, e);
+    });
+}
+// ─── Hand start scheduling ────────────────────────────────────────────────────
+function scheduleStart(tableId) {
+    if (startTimers.has(tableId))
+        return;
+    if (sfEndedTables.has(tableId))
+        return;
+    const timer = setTimeout(() => {
+        startTimers.delete(tableId);
+        if (sfEndedTables.has(tableId))
+            return;
+        let state = tables.get(tableId);
+        if (!state || !canStartTable(tableId, state) || state.street !== 'waiting')
+            return;
+        if (tableId.startsWith('sf_')) {
+            if (!sfBlinds.has(tableId)) {
+                const cfg = getTableConfig(tableId);
+                sfBlinds.set(tableId, { level: 0, sb: cfg.sb, bb: cfg.bb, nextAt: Date.now() + 3 * 60000 });
+            }
+            applySFBlindsIfDue(tableId, state);
+            const bs = sfBlinds.get(tableId);
+            broadcastToTable(tableId, { type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb, nextLevelAt: bs.nextAt });
+        }
+        if ((0, spinFlip_1.getSFRoomId)(tableId))
+            startSFHand(state);
+        else
+            (0, game_1.startHand)(state);
+        tables.set(tableId, state);
+        broadcastTable(tableId);
+        setActionTimer(tableId);
+    }, 3000);
+    startTimers.set(tableId, timer);
+}
+// ─── Broadcast ────────────────────────────────────────────────────────────────
+function broadcastTable(tableId) {
+    const state = tables.get(tableId);
+    if (!state)
+        return;
+    const sfPrize = sfPrizes.get(tableId);
+    for (const [ws, client] of clients) {
+        if (client.tableId !== tableId)
+            continue;
+        if (ws.readyState !== ws_1.WebSocket.OPEN)
+            continue;
+        const msg = { type: 'state', state: (0, game_1.maskForPlayer)(state, client.playerId) };
+        if (sfPrize !== undefined)
+            msg.sfPrize = sfPrize;
+        send(ws, msg);
+    }
+}
+function broadcastToTable(tableId, msg) {
+    for (const [ws, client] of clients) {
+        if (client.tableId === tableId && ws.readyState === ws_1.WebSocket.OPEN)
+            send(ws, msg);
+    }
+}
+function send(ws, msg) {
+    if (ws.readyState === ws_1.WebSocket.OPEN)
+        ws.send(JSON.stringify(msg));
+}
+// ─── WS Entry ─────────────────────────────────────────────────────────────────
 function setupWS(wss) {
     wss.on('connection', (ws) => {
-        console.log('WS connected');
         ws.on('message', (data) => {
             try {
-                const msg = JSON.parse(data.toString());
-                handleMessage(ws, msg);
+                handleMessage(ws, JSON.parse(data.toString()));
             }
-            catch (e) {
+            catch {
                 send(ws, { type: 'error', message: 'Invalid message' });
             }
         });
@@ -96,51 +478,33 @@ function handleMessage(ws, msg) {
         return;
     }
     if (type === 'action') {
-        // Any explicit action clears AFK mode
         afkMode.delete(`${tableId}:${playerId}`);
         const { action, amount } = msg;
-        let state = tables.get(tableId);
+        const state = tables.get(tableId);
         if (!state)
             return;
         const prevStreet = state.street;
-        state = (0, game_1.applyAction)(state, playerId, action, amount);
+        (0, game_1.applyAction)(state, playerId, action, amount);
         tables.set(tableId, state);
         clearActionTimer(tableId);
         broadcastTable(tableId);
         if (state.street === 'showdown' && prevStreet !== 'showdown') {
-            // Reached showdown via normal action (e.g. everyone folded on river)
-            saveHandStats(state).catch(e => console.error('stats error:', e));
-            setTimeout(() => {
-                let s = tables.get(tableId);
-                if (!s)
-                    return;
-                if (canStartTable(tableId, s)) {
-                    s = (0, game_1.startHand)(s);
-                    tables.set(tableId, s);
-                }
-                else
-                    s.street = 'waiting';
-                broadcastTable(tableId);
-                setActionTimer(tableId);
-            }, 4000);
+            saveHandStats(state).catch(console.error);
+            scheduleNextHand(tableId);
+        }
+        else if (canAutoRunBoard(state)) {
+            runBoardToShowdown(tableId);
         }
         else {
-            // Борд идёт автоматически: все в олл-ин, или оставшиеся игроки могут только чекнуть
-            if (canAutoRunBoard(state)) {
-                console.log(`[AutoRun] ${tableId}: starting at ${state.street}`);
-                runBoardToShowdown(tableId);
-            }
-            else {
-                setActionTimer(tableId);
-            }
+            setActionTimer(tableId);
         }
         return;
     }
     if (type === 'start') {
-        let state = tables.get(tableId);
+        const state = tables.get(tableId);
         if (!state || !canStartTable(tableId, state))
             return send(ws, { type: 'error', message: 'Need 2+ players' });
-        state = (0, game_1.startHand)(state);
+        (0, game_1.startHand)(state);
         tables.set(tableId, state);
         broadcastTable(tableId);
         setActionTimer(tableId);
@@ -150,20 +514,16 @@ function handleMessage(ws, msg) {
         broadcastToTable(tableId, { type: 'chat', playerId, playerName: client.playerName, message: String(msg.message).slice(0, 200) });
         return;
     }
-    // Emoji reaction — broadcast to all at table
     if (type === 'reaction') {
-        const emoji = String(msg.emoji || '👏').slice(0, 2);
-        broadcastToTable(tableId, { type: 'reaction', playerId, playerName: client.playerName, emoji });
+        broadcastToTable(tableId, { type: 'reaction', playerId, playerName: client.playerName, emoji: String(msg.emoji || 'gg').slice(0, 20) });
         return;
     }
-    // Show own cards voluntarily — supports specific card indices
     if (type === 'show_cards') {
-        const { tableId, playerId } = client;
         const state = tables.get(tableId);
         if (!state)
             return;
         const player = state.players.find(p => p.id === playerId);
-        if (!player || !player.holeCards?.length)
+        if (!player?.holeCards?.length)
             return;
         const indices = Array.isArray(msg.indices)
             ? msg.indices.filter((i) => i === 0 || i === 1)
@@ -181,7 +541,7 @@ function handleMessage(ws, msg) {
         const cfg = TABLE_CONFIG[tableId] || TABLE_CONFIG.main;
         if (!amount || amount <= 0)
             return send(ws, { type: 'error', code: 'rebuy_failed', message: 'Invalid amount' });
-        let state = tables.get(tableId);
+        const state = tables.get(tableId);
         if (!state)
             return;
         const playerInState = state.players.find(p => p.id === playerId);
@@ -193,20 +553,95 @@ function handleMessage(ws, msg) {
             return send(ws, { type: 'error', code: 'rebuy_failed', message: `Max rebuy: ${maxAllowed}` });
         if (amount < cfg.minBuyIn && maxAllowed >= cfg.minBuyIn)
             return send(ws, { type: 'error', code: 'rebuy_failed', message: `Min rebuy: ${cfg.minBuyIn}` });
-        // Move amount from bank → table chips
-        const newBank = bank - amount;
-        playerBanks.set(bankKey, newBank);
-        const newPlayers = state.players.map(p => p.id === playerId ? { ...p, chips: p.chips + amount, folded: false, allIn: false } : p);
-        state = { ...state, players: newPlayers };
+        playerBanks.set(bankKey, bank - amount);
+        playerInState.chips += amount;
+        playerInState.folded = false;
+        playerInState.allIn = false;
         tables.set(tableId, state);
-        // Sync DB: bank decreased by amount
         if (process.env.DATABASE_URL) {
-            (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => { });
+            (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [bank - amount, playerId]).catch(() => { });
             (0, db_1.logTransaction)(playerId, 'table_join', -amount, `Re-buy at ${tableId} (+${amount.toLocaleString()} chips)`);
         }
         broadcastTable(tableId);
-        send(ws, { type: 'rebuy_ok', chips: playerInState.chips + amount, bank: newBank });
+        send(ws, { type: 'rebuy_ok', chips: playerInState.chips, bank: bank - amount });
         scheduleStart(tableId);
+        return;
+    }
+    if (type === 'sit_out') {
+        sitOutSet.add(`${tableId}:${playerId}`);
+        afkMode.add(`${tableId}:${playerId}`);
+        return;
+    }
+    if (type === 'sit_in') {
+        sitOutSet.delete(`${tableId}:${playerId}`);
+        afkMode.delete(`${tableId}:${playerId}`);
+        send(ws, { type: 'here_ok' });
+        return;
+    }
+    if (type === 'afk_request') {
+        const duration = Math.min(Math.max(Number(msg.duration) || 300, 60), 600);
+        const key = `${tableId}:${playerId}`;
+        afkMode.add(key);
+        send(ws, { type: 'you_are_afk' });
+        const existing = afkRequestTimers.get(key);
+        if (existing)
+            clearTimeout(existing);
+        afkRequestTimers.set(key, setTimeout(() => {
+            afkRequestTimers.delete(key);
+            afkMode.delete(key);
+            const ws2 = [...clients.entries()].find(([, c]) => c.playerId === playerId && c.tableId === tableId)?.[0];
+            if (ws2)
+                send(ws2, { type: 'here_ok' });
+        }, duration * 1000));
+        return;
+    }
+    if (type === 'send_bomb') {
+        const bombId = String(msg.bombId || '').slice(0, 32);
+        const tint = String(msg.tint || '#FF4D6D').slice(0, 16);
+        const targetId = String(msg.targetId || '').slice(0, 64);
+        const price = BOMB_PRICES[bombId] ?? 0;
+        const bankKey = `${tableId}:${playerId}`;
+        const bank = playerBanks.get(bankKey) ?? 0;
+        if (!price || bank < price) {
+            send(ws, { type: 'error', code: 'insufficient_chips', message: 'Not enough chips in bank', have: bank, required: price });
+            return;
+        }
+        const newBank = bank - price;
+        playerBanks.set(bankKey, newBank);
+        if (process.env.DATABASE_URL) {
+            (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => { });
+        }
+        send(ws, { type: 'bank_update', bank: newBank });
+        broadcastToTable(tableId, {
+            type: 'bomb_event', fromId: playerId, fromName: client.playerName,
+            targetId, bombId, tint,
+        });
+        return;
+    }
+    if (type === 'send_gift') {
+        const giftId = String(msg.giftId || '').slice(0, 32);
+        const tint = String(msg.tint || '#00FFB0').slice(0, 16);
+        const targetId = String(msg.targetId || '').slice(0, 64);
+        const price = GIFT_PRICES[giftId] ?? 0;
+        const bankKey = `${tableId}:${playerId}`;
+        const bank = playerBanks.get(bankKey) ?? 0;
+        if (!price || bank < price) {
+            send(ws, { type: 'error', code: 'insufficient_chips', message: 'Not enough chips in bank', have: bank, required: price });
+            return;
+        }
+        const newBank = bank - price;
+        playerBanks.set(bankKey, newBank);
+        if (process.env.DATABASE_URL) {
+            (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => { });
+        }
+        send(ws, { type: 'bank_update', bank: newBank });
+        if (!tableGifts.has(tableId))
+            tableGifts.set(tableId, new Map());
+        tableGifts.get(tableId).set(targetId, { giftId, tint, fromName: client.playerName });
+        broadcastToTable(tableId, {
+            type: 'gift_event', fromId: playerId, fromName: client.playerName,
+            targetId, giftId, tint,
+        });
         return;
     }
     if (type === 'ping') {
@@ -214,57 +649,49 @@ function handleMessage(ws, msg) {
         return;
     }
 }
+// ─── Disconnect handler ────────────────────────────────────────────────────────
 function handleDisconnect(ws) {
     const client = clients.get(ws);
     if (!client)
         return;
     clients.delete(ws);
     const { tableId, playerId } = client;
-    let state = tables.get(tableId);
+    const state = tables.get(tableId);
     if (!state)
         return;
-    // Save chips: bankChips (what's in DB) + table chips
     const player = state.players.find(p => p.id === playerId);
     if (player && process.env.DATABASE_URL) {
-        const bankKey = `${tableId}:${playerId}`;
-        const bank = playerBanks.get(bankKey) ?? 0;
-        if ((0, spinFlip_1.getSFRoomId)(tableId)) {
-            // SF: buy-in already deducted at registration; play chips don't cash out
-            // DB balance stays at bank (no additional changes)
-        }
-        else {
+        const bank = playerBanks.get(`${tableId}:${playerId}`) ?? 0;
+        if (!(0, spinFlip_1.getSFRoomId)(tableId)) {
             const totalToSave = bank + player.chips;
-            (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [totalToSave, playerId])
-                .catch(e => console.error('Failed to save chips on disconnect:', e));
-            if (player.chips !== 0) {
-                (0, db_1.logTransaction)(playerId, 'table_leave', player.chips, `Cash out from ${tableId} (${player.chips.toLocaleString()} chips)`);
-            }
+            (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [totalToSave, playerId]).catch(console.error);
+            if (player.chips !== 0)
+                (0, db_1.logTransaction)(playerId, 'table_leave', player.chips, `Cash out from ${tableId}`);
         }
     }
-    // Clear AFK mode flag
     afkMode.delete(`${tableId}:${playerId}`);
-    // Mark as disconnected (stays in player list)
-    state = (0, game_1.removePlayer)(state, playerId);
+    sitOutSet.delete(`${tableId}:${playerId}`);
+    const afkReqTimer = afkRequestTimers.get(`${tableId}:${playerId}`);
+    if (afkReqTimer) {
+        clearTimeout(afkReqTimer);
+        afkRequestTimers.delete(`${tableId}:${playerId}`);
+    }
+    (0, game_1.removePlayer)(state, playerId);
     tables.set(tableId, state);
     broadcastTable(tableId);
     const inActiveHand = state.street !== 'waiting' && state.street !== 'showdown';
-    if (inActiveHand) {
+    if (inActiveHand)
         setTimeout(() => resolveHandAfterDisconnect(tableId), 600);
-    }
-    // SF: player stays seated as AFK — never auto-removed (they paid buy-in, must play out)
-    if ((0, spinFlip_1.getSFRoomId)(tableId)) {
-        console.log(`SF player ${playerId} disconnected — staying seated AFK at ${tableId}`);
-        return;
-    }
-    // Cash/tournament: remove player slot after 30s without reconnect
+    if ((0, spinFlip_1.getSFRoomId)(tableId))
+        return; // SF players stay seated (paid buy-in)
     const afkKey = `${tableId}:${playerId}`;
-    const existingAfk = afkTimers.get(afkKey);
-    if (existingAfk)
-        clearTimeout(existingAfk);
-    const afkTimer = setTimeout(() => {
+    const existing = afkTimers.get(afkKey);
+    if (existing)
+        clearTimeout(existing);
+    afkTimers.set(afkKey, setTimeout(() => {
         afkTimers.delete(afkKey);
         playerBanks.delete(`${tableId}:${playerId}`);
-        let s = tables.get(tableId);
+        const s = tables.get(tableId);
         if (!s)
             return;
         const p = s.players.find(pp => pp.id === playerId);
@@ -272,367 +699,16 @@ function handleDisconnect(ws) {
             s.players = s.players.filter(pp => pp.id !== playerId);
             tables.set(tableId, s);
             broadcastTable(tableId);
-            console.log(`Player ${playerId} AFK timeout — removed from ${tableId}`);
         }
-    }, 30000);
-    afkTimers.set(afkKey, afkTimer);
-    console.log(`Player ${playerId} disconnected (AFK timer started), chips: ${player?.chips}`);
+    }, 30000));
 }
-function scheduleStart(tableId) {
-    if (startTimers.has(tableId))
-        return;
-    if (sfEndedTables.has(tableId))
-        return; // SF game already finished
-    const timer = setTimeout(() => {
-        startTimers.delete(tableId);
-        if (sfEndedTables.has(tableId))
-            return; // check again inside timer
-        let state = tables.get(tableId);
-        if (!state || !canStartTable(tableId, state) || state.street !== 'waiting')
-            return;
-        // SF: init blind tracker on first hand, then double blinds every 3 min
-        if (tableId.startsWith('sf_')) {
-            if (!sfBlinds.has(tableId)) {
-                const cfg = getTableConfig(tableId);
-                sfBlinds.set(tableId, { level: 0, sb: cfg.sb, bb: cfg.bb, nextAt: Date.now() + 3 * 60000 });
-            }
-            const bs = sfBlinds.get(tableId);
-            if (Date.now() >= bs.nextAt) {
-                bs.level++;
-                bs.sb *= 2;
-                bs.bb *= 2;
-                bs.nextAt = Date.now() + 3 * 60000;
-                state = { ...state, smallBlind: bs.sb, bigBlind: bs.bb, minRaise: bs.bb };
-                tables.set(tableId, state);
-                broadcastToTable(tableId, { type: 'blind_increase', level: bs.level, sb: bs.sb, bb: bs.bb });
-            }
-            // Broadcast current blind status to all players at table
-            broadcastToTable(tableId, { type: 'sf_blind_status', level: bs.level, sb: bs.sb, bb: bs.bb, nextLevelAt: bs.nextAt });
-        }
-        state = (0, game_1.startHand)(state);
-        tables.set(tableId, state);
-        broadcastTable(tableId);
-        setActionTimer(tableId);
-    }, 3000);
-    startTimers.set(tableId, timer);
-}
-// If only 1 connected non-folded player remains, end the hand immediately and give them the pot.
-// Otherwise fall back to foldDisconnectedPlayers.
-function resolveHandAfterDisconnect(tableId) {
-    let s = tables.get(tableId);
-    if (!s || s.street === 'waiting' || s.street === 'showdown')
-        return;
-    const connectedActive = s.players.filter(p => p.connected && !p.folded);
-    if (connectedActive.length <= 1) {
-        clearActionTimer(tableId);
-        // Fold all disconnected non-folded players
-        const players = s.players.map(p => (!p.connected && !p.folded) ? { ...p, folded: true, hasActed: true } : { ...p });
-        const notFolded = players.filter(p => !p.folded);
-        let newState = { ...s, players };
-        if (notFolded.length === 1) {
-            const winner = notFolded[0];
-            players.find(p => p.id === winner.id).chips += newState.pot;
-            newState = { ...newState, players, winners: [{ playerId: winner.id, amount: newState.pot, hand: 'Last standing' }], pot: 0, street: 'showdown' };
-        }
-        else {
-            newState = { ...newState, street: 'waiting' };
-        }
-        tables.set(tableId, newState);
-        broadcastTable(tableId);
-        if (newState.street === 'showdown') {
-            saveHandStats(newState).catch(console.error);
-            setTimeout(() => {
-                if (sfEndedTables.has(tableId))
-                    return; // SF finished during saveHandStats
-                let s2 = tables.get(tableId);
-                if (!s2)
-                    return;
-                s2 = canStartTable(tableId, s2) ? (0, game_1.startHand)(s2) : { ...s2, street: 'waiting' };
-                tables.set(tableId, s2);
-                broadcastTable(tableId);
-            }, 2000);
-        }
-        return;
-    }
-    // Multiple connected players remain — use normal per-turn fold logic
-    foldDisconnectedPlayers(tableId);
-}
-// Fold all disconnected players who need to act, until a connected player's turn.
-// Called after any disconnect to quickly resolve stuck hands.
-function foldDisconnectedPlayers(tableId) {
-    let s = tables.get(tableId);
-    if (!s || s.street === 'waiting' || s.street === 'showdown')
-        return;
-    const p = s.players[s.actionIdx];
-    if (!p || p.folded || p.allIn)
-        return;
-    if (p.connected)
-        return; // connected player — let them act normally
-    clearActionTimer(tableId);
-    s = (0, game_1.applyAction)(s, p.id, 'fold');
-    tables.set(tableId, s);
-    broadcastTable(tableId);
-    if (s.street === 'showdown') {
-        saveHandStats(s).catch(console.error);
-        setTimeout(() => {
-            let s2 = tables.get(tableId);
-            if (!s2)
-                return;
-            s2 = canStartTable(tableId, s2) ? (0, game_1.startHand)(s2) : { ...s2, street: 'waiting' };
-            tables.set(tableId, s2);
-            broadcastTable(tableId);
-            setActionTimer(tableId);
-        }, 2000); // shorter delay when auto-resolved
-    }
-    else {
-        // Recurse — next player might also be disconnected
-        setTimeout(() => foldDisconnectedPlayers(tableId), 150);
-        setActionTimer(tableId);
-    }
-}
-function setActionTimer(tableId) {
-    clearActionTimer(tableId);
-    // Don't set a timer if a board runout is already in progress
-    if (runoutTables.has(tableId))
-        return;
-    let state = tables.get(tableId);
-    if (state) {
-        // Автоматический ранаут: все в олл-ин или оставшиеся могут только чекнуть
-        if (canAutoRunBoard(state)) {
-            console.log(`[AutoRun] ${tableId}: setActionTimer triggered runout at ${state.street}`);
-            runBoardToShowdown(tableId);
-            return;
-        }
-        // Disconnected player at the wheel — fold them immediately (no 30s wait)
-        const p = state.players[state.actionIdx];
-        if (p && !p.folded && !p.allIn && !p.connected) {
-            const timer = setTimeout(() => foldDisconnectedPlayers(tableId), 800);
-            actionTimers.set(tableId, timer);
-            return;
-        }
-        // AFK mode: connected player already timed out once — quick-fold without waiting 30s
-        if (p && !p.folded && !p.allIn && p.connected && afkMode.has(`${tableId}:${p.id}`)) {
-            const timer = setTimeout(() => {
-                let st = tables.get(tableId);
-                if (!st || st.street === 'waiting' || st.street === 'showdown')
-                    return;
-                if (canAutoRunBoard(st)) {
-                    runBoardToShowdown(tableId);
-                    return;
-                }
-                const pp = st.players[st.actionIdx];
-                if (!pp || pp.folded || pp.allIn) {
-                    setActionTimer(tableId);
-                    return;
-                }
-                st = (0, game_1.applyAction)(st, pp.id, 'fold');
-                tables.set(tableId, st);
-                broadcastTable(tableId);
-                if (st.street === 'showdown') {
-                    saveHandStats(st).catch(console.error);
-                    setTimeout(() => {
-                        let s = tables.get(tableId);
-                        if (!s)
-                            return;
-                        s = canStartTable(tableId, s) ? (0, game_1.startHand)(s) : { ...s, street: 'waiting' };
-                        tables.set(tableId, s);
-                        broadcastTable(tableId);
-                        setActionTimer(tableId);
-                    }, 4000);
-                }
-                else {
-                    setActionTimer(tableId);
-                }
-            }, 800);
-            actionTimers.set(tableId, timer);
-            return;
-        }
-    }
-    const timer = setTimeout(() => {
-        let state = tables.get(tableId);
-        if (!state || state.street === 'waiting' || state.street === 'showdown')
-            return;
-        if (canAutoRunBoard(state)) {
-            console.log(`[AutoRun] ${tableId}: timer fired, triggering runout at ${state.street}`);
-            runBoardToShowdown(tableId);
-            return;
-        }
-        const p = state.players[state.actionIdx];
-        if (!p || p.folded || p.allIn) {
-            setActionTimer(tableId);
-            return;
-        }
-        // Auto-fold timed-out player + enter AFK mode
-        state = (0, game_1.applyAction)(state, p.id, 'fold');
-        tables.set(tableId, state);
-        broadcastTable(tableId);
-        // Mark as AFK — next turn will be instant-fold
-        const afkKey = `${tableId}:${p.id}`;
-        afkMode.add(afkKey);
-        // Notify the player
-        for (const [ws2, c2] of clients) {
-            if (c2.tableId === tableId && c2.playerId === p.id && ws2.readyState === ws_1.WebSocket.OPEN) {
-                send(ws2, { type: 'you_are_afk' });
-            }
-        }
-        if (state.street === 'showdown') {
-            saveHandStats(state).catch(console.error);
-            setTimeout(() => {
-                let s = tables.get(tableId);
-                if (!s)
-                    return;
-                s = canStartTable(tableId, s) ? (0, game_1.startHand)(s) : { ...s, street: 'waiting' };
-                tables.set(tableId, s);
-                broadcastTable(tableId);
-                setActionTimer(tableId);
-            }, 4000);
-        }
-        else {
-            setActionTimer(tableId);
-        }
-    }, ACTION_TIMEOUT_MS);
-    actionTimers.set(tableId, timer);
-}
-function clearActionTimer(tableId) {
-    const t = actionTimers.get(tableId);
-    if (t) {
-        clearTimeout(t);
-        actionTimers.delete(tableId);
-    }
-}
-// Returns true if the board should run automatically:
-// 1. All non-folded players are all-in, OR
-// 2. Remaining non-all-in players can ONLY check (toCall=0, all opponents are all-in)
-//    — i.e. no real betting decision is possible
-function canAutoRunBoard(state) {
-    if (state.street === 'showdown' || state.street === 'waiting')
-        return false;
-    const activePlayers = state.players.filter(p => !p.folded && !p.allIn);
-    if (activePlayers.length === 0)
-        return true; // everyone all-in
-    // Each active player can only check if: nothing to call AND no opponent that can bet back
-    return activePlayers.every(p => {
-        const toCall = Math.max(0, state.currentBet - p.bet);
-        if (toCall > 0)
-            return false;
-        const opponentCanBet = state.players.some(pp => !pp.folded && !pp.allIn && pp.id !== p.id);
-        return !opponentCanBet;
-    });
-}
-// Run remaining board streets automatically (all-in runout OR check-only situation).
-// Uses async/await + mutex to prevent double execution and stale state bugs.
-function runBoardToShowdown(tableId) {
-    if (runoutTables.has(tableId)) {
-        console.log(`[RunBoard] ${tableId}: already running, skip`);
-        return;
-    }
-    const s = tables.get(tableId);
-    if (!s || !canAutoRunBoard(s)) {
-        if (s && !canAutoRunBoard(s))
-            setActionTimer(tableId);
-        return;
-    }
-    runoutTables.add(tableId);
-    clearActionTimer(tableId);
-    console.log(`[RunBoard] ${tableId}: starting from ${s.street}`);
-    const CARD_DELAY = 1000; // 1s между улицами — как в реальных покер-румах
-    async function loop() {
-        try {
-            while (true) {
-                await new Promise(res => setTimeout(res, CARD_DELAY));
-                let state = tables.get(tableId);
-                if (!state || state.street === 'showdown' || state.street === 'waiting')
-                    break;
-                if (!canAutoRunBoard(state)) {
-                    // Ситуация изменилась (например, ребай) — передаём управление таймеру
-                    console.log(`[RunBoard] ${tableId}: player can now bet, stopping runout`);
-                    setActionTimer(tableId);
-                    return;
-                }
-                // advanceStreet разбирает оба случая:
-                // • все в олл-ин → просто раскладывает карты
-                // • остался игрок с фишками, но все оппоненты в олл-ин → улица тоже завершена
-                state = (0, game_1.advanceStreet)(state);
-                tables.set(tableId, state);
-                broadcastTable(tableId);
-                console.log(`[RunBoard] ${tableId}: dealt ${state.street}`);
-                if (state.street === 'showdown') {
-                    saveHandStats(state).catch(e => console.error('[RunBoard] stats error:', e));
-                    await new Promise(res => setTimeout(res, 4000));
-                    let s2 = tables.get(tableId);
-                    if (!s2)
-                        break;
-                    s2 = canStartTable(tableId, s2) ? (0, game_1.startHand)(s2) : { ...s2, street: 'waiting' };
-                    tables.set(tableId, s2);
-                    broadcastTable(tableId);
-                    setActionTimer(tableId);
-                    break;
-                }
-            }
-        }
-        finally {
-            runoutTables.delete(tableId);
-            console.log(`[RunBoard] ${tableId}: runout complete`);
-        }
-    }
-    loop().catch(e => {
-        runoutTables.delete(tableId);
-        console.error(`[RunBoard] ${tableId}: error`, e);
-    });
-}
-function broadcastTable(tableId) {
-    const state = tables.get(tableId);
-    if (!state)
-        return;
-    // Send each player their own masked view
-    for (const [ws, client] of clients) {
-        if (client.tableId !== tableId)
-            continue;
-        if (ws.readyState !== ws_1.WebSocket.OPEN)
-            continue;
-        const masked = (0, game_1.maskForPlayer)(state, client.playerId);
-        send(ws, { type: 'state', state: masked });
-    }
-}
-function broadcastToTable(tableId, msg) {
-    for (const [ws, client] of clients) {
-        if (client.tableId === tableId && ws.readyState === ws_1.WebSocket.OPEN)
-            send(ws, msg);
-    }
-}
-function send(ws, msg) {
-    if (ws.readyState === ws_1.WebSocket.OPEN)
-        ws.send(JSON.stringify(msg));
-}
-function getTableStats() {
-    const stats = {};
-    for (const [tableId, state] of tables) {
-        const config = getTableConfig(tableId);
-        stats[tableId] = {
-            players: state.players.filter(p => p.connected).length,
-            maxPlayers: config.maxPlayers || 6,
-            street: state.street,
-        };
-    }
-    return stats;
-}
-const TOURNAMENT_TABLE_IDS = new Set(['daily', 'weekly']);
-function getTableConfig(tableId) {
-    return TABLE_CONFIG[tableId] || (0, spinFlip_1.getSFTableConfig)(tableId) || TABLE_CONFIG.main;
-}
-// SF tables: count all players with chips (AFK included). Cash tables: require connected.
-function canStartTable(tableId, state) {
-    if ((0, spinFlip_1.getSFRoomId)(tableId))
-        return state.players.filter(p => p.chips > 0).length >= 2;
-    return (0, game_1.canStart)(state);
-}
+// ─── Join handler ─────────────────────────────────────────────────────────────
 async function handleJoin(ws, msg) {
     const { tableId = 'main', playerId, playerName, buyIn: requestedBuyIn } = msg;
     if (!playerId || !playerName)
         return send(ws, { type: 'error', message: 'Need playerId and playerName' });
     const config = getTableConfig(tableId);
     const isSFTable = (0, spinFlip_1.getSFRoomId)(tableId) !== null;
-    // Tournament access control
     if (TOURNAMENT_TABLE_IDS.has(tableId) && process.env.DATABASE_URL) {
         try {
             const db = (0, db_1.getPool)();
@@ -640,20 +716,15 @@ async function handleJoin(ws, msg) {
                 db.query(`SELECT status FROM pf_tournament_status WHERE tournament_id=$1`, [tableId]),
                 db.query(`SELECT 1 FROM pf_tournament_regs WHERE tournament_id=$1 AND tg_id=$2`, [tableId, playerId]),
             ]);
-            const status = statusRes.rows[0]?.status || 'pending';
-            const isRegistered = regRes.rows.length > 0;
-            if (status !== 'active') {
+            if (statusRes.rows[0]?.status !== 'active')
                 return send(ws, { type: 'error', message: 'Tournament has not started yet', code: 'tournament_not_active' });
-            }
-            if (!isRegistered) {
+            if (!regRes.rows.length)
                 return send(ws, { type: 'error', message: 'You are not registered for this tournament', code: 'tournament_not_registered' });
-            }
         }
         catch (e) {
             console.error('Tournament access check error:', e);
         }
     }
-    // Spin & Flip access control
     if (isSFTable && process.env.DATABASE_URL) {
         try {
             const db = (0, db_1.getPool)();
@@ -661,7 +732,7 @@ async function handleJoin(ws, msg) {
             if (!sessionId)
                 return send(ws, { type: 'error', message: 'Invalid SF table', code: 'sf_invalid' });
             const [sRes, rRes] = await Promise.all([
-                db.query(`SELECT status, prize FROM pf_sf_sessions WHERE id=$1`, [sessionId]),
+                db.query(`SELECT status FROM pf_sf_sessions WHERE id=$1`, [sessionId]),
                 db.query(`SELECT 1 FROM pf_sf_registrations WHERE session_id=$1 AND tg_id=$2`, [sessionId, playerId]),
             ]);
             if (sRes.rows[0]?.status !== 'ready')
@@ -673,12 +744,10 @@ async function handleJoin(ws, msg) {
             console.error('SF access check error:', e);
         }
     }
-    // Load total chips from DB
     let totalChips = config.minBuyIn;
     if (process.env.DATABASE_URL) {
         try {
-            const db = (0, db_1.getPool)();
-            const { rows } = await db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [playerId]);
+            const { rows } = await (0, db_1.getPool)().query('SELECT chips FROM pf_users WHERE tg_id=$1', [playerId]);
             if (rows[0])
                 totalChips = rows[0].chips;
         }
@@ -686,99 +755,109 @@ async function handleJoin(ws, msg) {
             console.error('Failed to load chips:', e);
         }
     }
-    // SF: buy-in already deducted at HTTP registration → give play stack without DB deduction
     let playerChips;
     let bankChips;
     if (isSFTable) {
         playerChips = config.minBuyIn;
-        bankChips = totalChips; // keep DB balance as bank (unchanged)
+        bankChips = totalChips;
     }
     else {
-        // Check min buy-in against total chips
-        if (totalChips < config.minBuyIn) {
-            return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips for this table`, code: 'insufficient_chips', required: config.minBuyIn, have: totalChips });
-        }
+        if (totalChips < config.minBuyIn)
+            return send(ws, { type: 'error', message: `Need at least ${config.minBuyIn} chips`, code: 'insufficient_chips', required: config.minBuyIn, have: totalChips });
         const maxBuyIn = Math.min(totalChips, config.bb * 200);
-        playerChips = requestedBuyIn
-            ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips))
-            : Math.min(totalChips, maxBuyIn);
+        playerChips = requestedBuyIn ? Math.max(config.minBuyIn, Math.min(requestedBuyIn, totalChips)) : Math.min(totalChips, maxBuyIn);
         bankChips = totalChips - playerChips;
     }
-    // Declare maxPlayers early (needed for reconnect path too)
     const maxPlayers = config.maxPlayers || 6;
-    // Cancel any pending AFK removal timer for this player
     const afkKey = `${tableId}:${playerId}`;
     const pendingAfk = afkTimers.get(afkKey);
     if (pendingAfk) {
         clearTimeout(pendingAfk);
         afkTimers.delete(afkKey);
     }
-    // Get or create table with correct blinds
     if (!tables.has(tableId))
         tables.set(tableId, (0, game_1.createTable)(tableId, config.sb, config.bb));
-    let state = tables.get(tableId);
-    // Handle reconnection — player already at this table but disconnected
-    const reconnectingPlayer = state.players.find(p => p.id === playerId && !p.connected);
-    if (reconnectingPlayer) {
+    const state = tables.get(tableId);
+    // Reconnect path
+    const reconnecting = state.players.find(p => p.id === playerId && !p.connected);
+    if (reconnecting) {
         afkMode.delete(afkKey);
-        state = (0, game_1.addPlayer)(state, playerId, playerName, reconnectingPlayer.chips, reconnectingPlayer.seatIndex);
+        (0, game_1.addPlayer)(state, playerId, playerName, reconnecting.chips, reconnecting.seatIndex);
         tables.set(tableId, state);
         clients.set(ws, { ws, playerId, playerName, tableId });
+        let bankForMsg = 0;
+        if (isSFTable && process.env.DATABASE_URL) {
+            try {
+                const db = (0, db_1.getPool)();
+                const sessionId = tableId.match(/_(\d+)$/)?.[1];
+                const [bankRes, prizeRes] = await Promise.all([
+                    db.query('SELECT chips FROM pf_users WHERE tg_id=$1', [playerId]),
+                    sessionId ? db.query('SELECT prize FROM pf_sf_sessions WHERE id=$1', [sessionId]) : Promise.resolve(null),
+                ]);
+                if (bankRes.rows[0]) {
+                    bankForMsg = bankRes.rows[0].chips;
+                    playerBanks.set(`${tableId}:${playerId}`, bankForMsg);
+                }
+                if (prizeRes?.rows[0]) {
+                    sfPrizes.set(tableId, prizeRes.rows[0].prize);
+                    broadcastToTable(tableId, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) });
+                }
+            }
+            catch { }
+        }
         broadcastTable(tableId);
-        send(ws, { type: 'joined', playerId, tableId, chips: reconnectingPlayer.chips, maxPlayers });
-        console.log(`Player ${playerId} reconnected to ${tableId} with ${reconnectingPlayer.chips} chips`);
-        scheduleStart(tableId);
+        send(ws, { type: 'joined', playerId, tableId, chips: reconnecting.chips, maxPlayers, bank: bankForMsg || undefined });
+        const midHand = state.street !== 'waiting' && state.street !== 'showdown';
+        if (midHand && !actionTimers.has(tableId) && !runoutTables.has(tableId)) {
+            setActionTimer(tableId);
+        }
+        else {
+            scheduleStart(tableId);
+        }
         return;
     }
-    // Check max players
-    if (state.players.filter(p => p.connected).length >= maxPlayers) {
+    if (state.players.filter(p => p.connected).length >= maxPlayers)
         return send(ws, { type: 'error', message: 'Table is full', code: 'table_full' });
-    }
-    // Find free seat
     const allSeats = Array.from({ length: maxPlayers }, (_, i) => i);
     const takenSeats = state.players.map(p => p.seatIndex);
     const seat = allSeats.find(s => !takenSeats.includes(s)) ?? 0;
-    state = (0, game_1.addPlayer)(state, playerId, playerName, playerChips, seat);
+    (0, game_1.addPlayer)(state, playerId, playerName, playerChips, seat);
     tables.set(tableId, state);
     clients.set(ws, { ws, playerId, playerName, tableId });
     playerBanks.set(`${tableId}:${playerId}`, bankChips);
     if (!isSFTable && process.env.DATABASE_URL) {
-        // Normal table: deduct buy-in from DB now
-        (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [bankChips, playerId])
-            .catch(e => console.error('Failed to deduct buy-in:', e));
+        (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [bankChips, playerId]).catch(console.error);
         (0, db_1.logTransaction)(playerId, 'table_join', -playerChips, `Buy-in at ${tableId} (${playerChips.toLocaleString()} chips)`);
     }
-    // SF: pre-seed other registered players as AFK so game starts even if they haven't opened WS
+    // SF: pre-seed other registered players as AFK
     if (isSFTable && process.env.DATABASE_URL) {
         const sessionId = tableId.match(/_(\d+)$/)?.[1];
         if (sessionId) {
             const db = (0, db_1.getPool)();
-            // Fetch prize + seed AFK players in parallel
             const [prizeRes, regRes] = await Promise.all([
                 db.query(`SELECT prize FROM pf_sf_sessions WHERE id=$1`, [sessionId]),
-                db.query(`SELECT r.tg_id, COALESCE(u.first_name, 'Player') AS name
-           FROM pf_sf_registrations r LEFT JOIN pf_users u ON u.tg_id = r.tg_id
-           WHERE r.session_id = $1`, [sessionId]),
+                db.query(`SELECT r.tg_id, COALESCE(u.first_name,'Player') AS name
+                  FROM pf_sf_registrations r LEFT JOIN pf_users u ON u.tg_id=r.tg_id
+                  WHERE r.session_id=$1`, [sessionId]),
             ]).catch(() => [null, null]);
             if (prizeRes?.rows[0]) {
-                send(ws, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) });
+                sfPrizes.set(tableId, prizeRes.rows[0].prize);
+                broadcastToTable(tableId, { type: 'sf_prize', prize: prizeRes.rows[0].prize, sessionId: Number(sessionId) });
             }
             if (regRes?.rows) {
-                let st = tables.get(tableId);
                 for (const reg of regRes.rows) {
                     if (reg.tg_id === playerId)
-                        continue; // already seated above
-                    if (st.players.find((p) => p.id === reg.tg_id))
-                        continue; // already in table
-                    const takenS = st.players.map((p) => p.seatIndex);
-                    const freeSeat = Array.from({ length: maxPlayers }, (_, i) => i).find(s => !takenS.includes(s)) ?? 0;
-                    st = (0, game_1.addPlayer)(st, reg.tg_id, reg.name, config.minBuyIn, freeSeat);
-                    // Mark as AFK (not connected via WS yet)
-                    const afkP = st.players.find((p) => p.id === reg.tg_id);
+                        continue;
+                    if (state.players.find(p => p.id === reg.tg_id))
+                        continue;
+                    const taken = state.players.map(p => p.seatIndex);
+                    const free = Array.from({ length: maxPlayers }, (_, i) => i).find(s => !taken.includes(s)) ?? 0;
+                    (0, game_1.addPlayer)(state, reg.tg_id, reg.name, config.minBuyIn, free);
+                    const afkP = state.players.find(p => p.id === reg.tg_id);
                     if (afkP)
                         afkP.connected = false;
                 }
-                tables.set(tableId, st);
+                tables.set(tableId, state);
             }
         }
     }
@@ -786,39 +865,33 @@ async function handleJoin(ws, msg) {
     send(ws, { type: 'joined', playerId, tableId, chips: playerChips, maxPlayers, bank: bankChips });
     scheduleStart(tableId);
 }
+// ─── Stats & tournament end ────────────────────────────────────────────────────
 async function checkSFEnd(state) {
     const tableId = state.tableId;
     const sessionId = Number(tableId.match(/_(\d+)$/)?.[1]);
     if (!sessionId)
         return;
     if (sfEndedTables.has(tableId))
-        return; // already ended — prevent double-call
-    // FIX: SF buy-in is deducted at registration; playerBanks = real user balance (unrelated to game).
-    // Only check play chips — a player is eliminated when their in-game stack hits 0.
+        return;
     const alive = state.players.filter(p => p.chips > 0);
     if (alive.length > 1)
         return;
     const winner = alive[0] || state.players.reduce((best, p) => p.chips > best.chips ? p : best, state.players[0]);
     if (!winner)
         return;
-    sfEndedTables.add(tableId); // mark before async call to prevent race condition
+    sfEndedTables.add(tableId);
     const result = await (0, spinFlip_1.completeSFSession)(sessionId, winner.id, winner.name).catch(e => {
         console.error('SF complete error:', e);
-        sfEndedTables.delete(tableId); // allow retry on error
+        sfEndedTables.delete(tableId);
         return null;
     });
     if (!result)
         return;
-    broadcastToTable(tableId, {
-        type: 'tournament_end',
-        winnerId: winner.id, winnerName: winner.name,
-        prize: result.prize, tableId,
-    });
-    console.log(`SF ${tableId} finished — winner: ${winner.id}, prize: ${result.prize}`);
-    // Clean up in-memory resources after clients receive the event
+    broadcastToTable(tableId, { type: 'tournament_end', winnerId: winner.id, winnerName: winner.name, prize: result.prize, tableId });
     setTimeout(() => {
         tables.delete(tableId);
         sfBlinds.delete(tableId);
+        sfPrizes.delete(tableId);
         sfEndedTables.delete(tableId);
         clearActionTimer(tableId);
         const st = startTimers.get(tableId);
@@ -834,8 +907,18 @@ async function checkSFEnd(state) {
             if (key.startsWith(`${tableId}:`))
                 afkMode.delete(key);
         }
+        for (const key of [...sitOutSet]) {
+            if (key.startsWith(`${tableId}:`))
+                sitOutSet.delete(key);
+        }
+        for (const key of [...afkRequestTimers.keys()]) {
+            if (key.startsWith(`${tableId}:`)) {
+                clearTimeout(afkRequestTimers.get(key));
+                afkRequestTimers.delete(key);
+            }
+        }
+        tableGifts.delete(tableId);
         runoutTables.delete(tableId);
-        console.log(`SF table ${tableId} resources cleaned up`);
     }, 9000);
 }
 async function saveHandStats(state) {
@@ -849,62 +932,47 @@ async function saveHandStats(state) {
             continue;
         const isWinner = winnerIds.has(player.id);
         const wonAmount = state.winners.find(w => w.playerId === player.id)?.amount || 0;
-        // Total chips = bank (outside table) + current table chips
-        const bankKey = `${state.tableId}:${player.id}`;
-        const bank = playerBanks.get(bankKey) ?? 0;
-        // SF: play chips are separate from real balance; don't update chips during game
-        const totalChips = isSF ? bank : bank + player.chips;
-        const { rows: updated } = await db.query(`UPDATE pf_users SET
-        chips        = $1,
-        hands_played = hands_played + 1,
-        hands_won    = hands_won + $2,
-        biggest_pot  = GREATEST(biggest_pot, $3)
-       WHERE tg_id = $4
-       RETURNING hands_played, referred_by, referral_credited, referral_bonus`, [totalChips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]).catch(() => ({ rows: [] }));
-        if (isWinner && wonAmount > 0) {
-            await (0, db_1.logTransaction)(player.id, 'win', wonAmount, `Won hand at table ${state.tableId}`);
+        let updated;
+        if (isSF) {
+            const r = await db.query(`UPDATE pf_users SET hands_played=hands_played+1, hands_won=hands_won+$1, biggest_pot=GREATEST(biggest_pot,$2)
+         WHERE tg_id=$3 RETURNING hands_played, referred_by, referral_credited, referral_bonus`, [isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]).catch(() => ({ rows: [] }));
+            updated = r.rows;
         }
-        // Anti-bot referral: +bonus to referrer after 10 hands (premium=3000, regular=1000)
+        else {
+            const bank = playerBanks.get(`${state.tableId}:${player.id}`) ?? 0;
+            const r = await db.query(`UPDATE pf_users SET chips=$1, hands_played=hands_played+1, hands_won=hands_won+$2, biggest_pot=GREATEST(biggest_pot,$3)
+         WHERE tg_id=$4 RETURNING hands_played, referred_by, referral_credited, referral_bonus`, [bank + player.chips, isWinner ? 1 : 0, isWinner ? wonAmount : 0, player.id]).catch(() => ({ rows: [] }));
+            updated = r.rows;
+        }
+        if (isWinner && wonAmount > 0)
+            await (0, db_1.logTransaction)(player.id, 'win', wonAmount, `Won hand at ${state.tableId}`);
         const row = updated[0];
         if (row && row.hands_played >= 10 && row.referred_by && !row.referral_credited) {
             const bonus = row.referral_bonus || 1000;
-            await db.query(`UPDATE pf_users SET chips = chips + $1, referrals_count = referrals_count + 1 WHERE tg_id = $2`, [bonus, row.referred_by]).catch(() => { });
-            await db.query(`UPDATE pf_users SET referral_credited = TRUE WHERE tg_id = $1`, [player.id]).catch(() => { });
+            await db.query(`UPDATE pf_users SET chips=chips+$1, referrals_count=referrals_count+1 WHERE tg_id=$2`, [bonus, row.referred_by]).catch(() => { });
+            await db.query(`UPDATE pf_users SET referral_credited=TRUE WHERE tg_id=$1`, [player.id]).catch(() => { });
             await (0, db_1.logTransaction)(row.referred_by, 'referral', bonus, `Referral bonus: ${player.id} completed 10 hands`);
-            console.log(`Referral credited: ${player.id} → referrer ${row.referred_by} +${bonus}`);
         }
     }
-    console.log(`Hand saved: winners=${[...winnerIds].join(',')}`);
-    // Save full hand history for replay/debugging
-    const historyPlayers = state.players.filter(p => p.holeCards?.length > 0).map(p => ({
-        id: p.id, name: p.name,
-        holeCards: p.holeCards,
-        folded: p.folded,
-        won: winnerIds.has(p.id),
-        wonAmount: state.winners.find(w => w.playerId === p.id)?.amount || 0,
-        hand: winnerIds.has(p.id) ? (state.winners.find(w => w.playerId === p.id)?.hand || '') : '',
-    }));
-    db.query(`INSERT INTO pf_hand_history (table_id, board, players, winners, pot) VALUES ($1,$2,$3,$4,$5)`, [state.tableId, JSON.stringify(state.board), JSON.stringify(historyPlayers), JSON.stringify(state.winners), state.pot + (state.winners.reduce((s, w) => s + w.amount, 0))]).catch(() => { });
-    // Tournament end: if only 1 player has chips left → distribute prizes
-    if (TOURNAMENT_TABLE_IDS.has(state.tableId)) {
-        await checkTournamentEnd(state).catch(e => console.error('Tournament end check error:', e));
-    }
-    // Spin & Flip end
-    if (isSF) {
-        await checkSFEnd(state).catch(e => console.error('SF end check error:', e));
-    }
+    db.query(`INSERT INTO pf_hand_history (table_id, board, players, winners, pot) VALUES ($1,$2,$3,$4,$5)`, [state.tableId, JSON.stringify(state.board), JSON.stringify(state.players.filter(p => p.holeCards?.length).map(p => ({
+            id: p.id, name: p.name, holeCards: p.holeCards, folded: p.folded,
+            won: winnerIds.has(p.id), wonAmount: state.winners.find(w => w.playerId === p.id)?.amount || 0,
+            hand: state.winners.find(w => w.playerId === p.id)?.hand || '',
+        }))), JSON.stringify(state.winners), state.winners.reduce((s, w) => s + w.amount, 0)]).catch(() => { });
+    if (TOURNAMENT_TABLE_IDS.has(state.tableId))
+        await checkTournamentEnd(state).catch(console.error);
+    if (isSF)
+        await checkSFEnd(state).catch(console.error);
 }
 async function checkTournamentEnd(state) {
     const db = (0, db_1.getPool)();
     const tableId = state.tableId;
-    // Players with 0 chips are eliminated
     const alive = state.players.filter(p => {
         const bank = playerBanks.get(`${tableId}:${p.id}`) ?? 0;
         return (bank + p.chips) > 0;
     });
     if (alive.length > 1)
-        return; // still playing
-    // Get tournament prize pool
+        return;
     const { rows: regRows } = await db.query(`SELECT COUNT(*) as cnt FROM pf_tournament_regs WHERE tournament_id=$1`, [tableId]).catch(() => ({ rows: [{ cnt: 0 }] }));
     const registered = Number(regRows[0]?.cnt || 0);
     const CONFIGS = {
@@ -915,31 +983,30 @@ async function checkTournamentEnd(state) {
     if (!cfg)
         return;
     const prizePool = Math.max(cfg.basePrize, registered * cfg.buyIn);
-    // Calculate prize tiers (same logic as index.ts)
     const tiers = registered <= 4 ? [{ place: 1, pct: 60 }, { place: 2, pct: 40 }]
         : registered <= 8 ? [{ place: 1, pct: 50 }, { place: 2, pct: 30 }, { place: 3, pct: 20 }]
             : [{ place: 1, pct: 40 }, { place: 2, pct: 25 }, { place: 3, pct: 15 }, { place: 4, pct: 12 }, { place: 5, pct: 8 }];
-    // Winner is the last alive player
     const winner = alive[0] || state.players[0];
     if (!winner)
         return;
-    // Award winner
     const winnerPrize = Math.floor(prizePool * tiers[0].pct / 100);
-    await db.query(`UPDATE pf_users SET chips = chips + $1, tournaments_won = tournaments_won + 1 WHERE tg_id=$2`, [winnerPrize, winner.id]).catch(() => { });
+    await db.query(`UPDATE pf_users SET chips=chips+$1, tournaments_won=tournaments_won+1 WHERE tg_id=$2`, [winnerPrize, winner.id]).catch(() => { });
     await (0, db_1.logTransaction)(winner.id, 'tournament_win', winnerPrize, `Won ${tableId} tournament! 🏆 +${winnerPrize.toLocaleString()} chips`);
-    // Save to history
-    await db.query(`INSERT INTO pf_tournament_history (tournament_id, winner_tg_id, winner_name, prize, players_count, prize_pool)
-     VALUES ($1,$2,$3,$4,$5,$6)`, [tableId, winner.id, winner.name, winnerPrize, registered, prizePool]).catch(() => { });
-    // Mark tournament as finished, reset registrations for next cycle
+    await db.query(`INSERT INTO pf_tournament_history (tournament_id,winner_tg_id,winner_name,prize,players_count,prize_pool) VALUES ($1,$2,$3,$4,$5,$6)`, [tableId, winner.id, winner.name, winnerPrize, registered, prizePool]).catch(() => { });
     await db.query(`UPDATE pf_tournament_status SET status='finished' WHERE tournament_id=$1`, [tableId]).catch(() => { });
     await db.query(`DELETE FROM pf_tournament_regs WHERE tournament_id=$1`, [tableId]).catch(() => { });
-    console.log(`Tournament ${tableId} ended! Winner: ${winner.id}, prize: ${winnerPrize}`);
-    // Broadcast tournament end to all players at the table
-    broadcastToTable(tableId, {
-        type: 'tournament_end',
-        winnerId: winner.id,
-        winnerName: winner.name,
-        prize: winnerPrize,
-        tableId,
-    });
+    broadcastToTable(tableId, { type: 'tournament_end', winnerId: winner.id, winnerName: winner.name, prize: winnerPrize, tableId });
+}
+// ─── HTTP stats ───────────────────────────────────────────────────────────────
+function getTableStats() {
+    const stats = {};
+    for (const [tableId, state] of tables) {
+        const config = getTableConfig(tableId);
+        stats[tableId] = {
+            players: state.players.filter(p => p.connected).length,
+            maxPlayers: config.maxPlayers || 6,
+            street: state.street,
+        };
+    }
+    return stats;
 }

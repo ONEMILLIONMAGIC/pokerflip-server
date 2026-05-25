@@ -56,7 +56,8 @@ app.post('/api/webhook', async (req, res) => {
             return;
         const chatId = msg.chat.id;
         const tgId = String(msg.from?.id || chatId);
-        const text = (msg.text || '').trim();
+        // Strip @botname from commands: /admin@pokerflip_bot lookup X → /admin lookup X
+        const text = (msg.text || '').trim().replace(/^(\/\w+)@\w+/, '$1');
         const firstName = msg.from?.first_name || 'Player';
         if (text.startsWith('/start')) {
             const refId = text.slice(6).trim();
@@ -119,146 +120,152 @@ app.post('/api/webhook', async (req, res) => {
         // Admin commands (only for admin tgId)
         else if (String(chatId) === (process.env.ADMIN_TG_ID || '501197162')) {
             const db = (0, db_1.getPool)();
-            if (text?.startsWith('/admin credit ')) {
-                // /admin credit <tgId> <amount> [reason]
-                const parts = text.split(' ');
-                const targetId = parts[2]?.trim();
-                const amount = parseInt(parts[3] || '0');
-                const reason = parts.slice(4).join(' ') || 'Admin credit';
-                if (!targetId || !amount || amount <= 0) {
-                    await tgSend(chatId, '❌ Usage: /admin credit <tgId> <amount> [reason]');
-                }
-                else {
-                    const { rows } = await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING first_name, chips', [amount, targetId]);
-                    if (!rows[0]) {
-                        await tgSend(chatId, `❌ User ${targetId} not found`);
+            try {
+                if (text?.startsWith('/admin credit ')) {
+                    // /admin credit <tgId> <amount> [reason]
+                    const parts = text.split(' ');
+                    const targetId = parts[2]?.trim();
+                    const amount = parseInt(parts[3] || '0');
+                    const reason = parts.slice(4).join(' ') || 'Admin credit';
+                    if (!targetId || !amount || amount <= 0) {
+                        await tgSend(chatId, '❌ Usage: /admin credit <tgId> <amount> [reason]');
                     }
                     else {
-                        await (0, db_1.logTransaction)(targetId, 'admin', amount, reason);
-                        await tgSend(chatId, `✅ Credited *+${amount.toLocaleString()} chips* to ${rows[0].first_name}\nNew balance: *${rows[0].chips.toLocaleString()} chips*`);
-                        await tgSend(targetId, `🎁 *+${amount.toLocaleString()} chips* от администратора!\n_${reason}_`, { reply_markup: PLAY_BTN });
+                        const { rows } = await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING first_name, chips', [amount, targetId]);
+                        if (!rows[0]) {
+                            await tgSend(chatId, `❌ User ${targetId} not found`);
+                        }
+                        else {
+                            await (0, db_1.logTransaction)(targetId, 'admin', amount, reason);
+                            await tgSend(chatId, `✅ Credited *+${amount.toLocaleString()} chips* to ${rows[0].first_name}\nNew balance: *${rows[0].chips.toLocaleString()} chips*`);
+                            await tgSend(targetId, `🎁 *+${amount.toLocaleString()} chips* от администратора!\n_${reason}_`, { reply_markup: PLAY_BTN });
+                        }
                     }
                 }
-            }
-            else if (text?.startsWith('/admin start ')) {
-                const id = text.split(' ')[2]?.trim();
-                if (!['daily', 'weekly'].includes(id)) {
-                    await tgSend(chatId, '❌ Unknown tournament. Use: daily or weekly');
-                }
-                else {
-                    const { rows: regRows } = await db.query(`SELECT COUNT(*) as cnt FROM pf_tournament_regs WHERE tournament_id=$1`, [id]);
-                    const registered = Number(regRows[0]?.cnt || 0);
-                    await db.query(`UPDATE pf_tournament_status SET status='active', cycle_key=$1, started_at=NOW() WHERE tournament_id=$2`, [`admin-${Date.now()}`, id]);
-                    // Notify registered players
-                    const { rows: players } = await db.query(`SELECT u.tg_id FROM pf_tournament_regs r JOIN pf_users u ON u.tg_id=r.tg_id WHERE r.tournament_id=$1`, [id]);
-                    for (const p of players) {
-                        tgSend(p.tg_id, `🏆 *Tournament Starting Now!*\nThe *${id === 'daily' ? 'Daily Grind' : 'Weekly Chill'}* has started! Join now!`, { reply_markup: PLAY_BTN }).catch(() => { });
+                else if (text?.startsWith('/admin start ')) {
+                    const id = text.split(' ')[2]?.trim();
+                    if (!['daily', 'weekly'].includes(id)) {
+                        await tgSend(chatId, '❌ Unknown tournament. Use: daily or weekly');
                     }
-                    await tgSend(chatId, `✅ Tournament *${id}* started. ${registered} players notified.`);
+                    else {
+                        const { rows: regRows } = await db.query(`SELECT COUNT(*) as cnt FROM pf_tournament_regs WHERE tournament_id=$1`, [id]);
+                        const registered = Number(regRows[0]?.cnt || 0);
+                        await db.query(`UPDATE pf_tournament_status SET status='active', cycle_key=$1, started_at=NOW() WHERE tournament_id=$2`, [`admin-${Date.now()}`, id]);
+                        // Notify registered players
+                        const { rows: players } = await db.query(`SELECT u.tg_id FROM pf_tournament_regs r JOIN pf_users u ON u.tg_id=r.tg_id WHERE r.tournament_id=$1`, [id]);
+                        for (const p of players) {
+                            tgSend(p.tg_id, `🏆 *Tournament Starting Now!*\nThe *${id === 'daily' ? 'Daily Grind' : 'Weekly Chill'}* has started! Join now!`, { reply_markup: PLAY_BTN }).catch(() => { });
+                        }
+                        await tgSend(chatId, `✅ Tournament *${id}* started. ${registered} players notified.`);
+                    }
                 }
-            }
-            else if (text?.startsWith('/admin end ')) {
-                const id = text.split(' ')[2]?.trim();
-                await db.query(`UPDATE pf_tournament_status SET status='pending', cycle_key='', started_at=NULL WHERE tournament_id=$1`, [id]);
-                await tgSend(chatId, `✅ Tournament *${id}* reset to pending.`);
-            }
-            else if (text === '/admin stats') {
-                const { rows } = await db.query(`SELECT tournament_id, status, started_at FROM pf_tournament_status`);
-                const { rows: reg } = await db.query(`SELECT tournament_id, COUNT(*) as cnt FROM pf_tournament_regs GROUP BY tournament_id`);
-                const regMap = {};
-                reg.forEach((r) => { regMap[r.tournament_id] = Number(r.cnt); });
-                const lines = rows.map((r) => `*${r.tournament_id}*: ${r.status} | ${regMap[r.tournament_id] || 0} registered`);
-                await tgSend(chatId, `📊 *Tournament Status*\n\n${lines.join('\n')}`);
-            }
-            else if (text === '/admin spin') {
-                await db.query(`UPDATE pf_users SET last_spin_at = NULL WHERE tg_id=$1`, [String(chatId)]);
-                await tgSend(chatId, `✅ Daily spin reset. Open the app to spin!`, { reply_markup: PLAY_BTN });
-            }
-            else if (text?.startsWith('/admin lookup ')) {
-                // /admin lookup <name_or_username>
-                const q = text.split(' ').slice(2).join(' ').trim();
-                const { rows } = await db.query(`SELECT tg_id, first_name, username, chips, hands_played, referred_by, referral_credited, referral_bonus
+                else if (text?.startsWith('/admin end ')) {
+                    const id = text.split(' ')[2]?.trim();
+                    await db.query(`UPDATE pf_tournament_status SET status='pending', cycle_key='', started_at=NULL WHERE tournament_id=$1`, [id]);
+                    await tgSend(chatId, `✅ Tournament *${id}* reset to pending.`);
+                }
+                else if (text === '/admin stats') {
+                    const { rows } = await db.query(`SELECT tournament_id, status, started_at FROM pf_tournament_status`);
+                    const { rows: reg } = await db.query(`SELECT tournament_id, COUNT(*) as cnt FROM pf_tournament_regs GROUP BY tournament_id`);
+                    const regMap = {};
+                    reg.forEach((r) => { regMap[r.tournament_id] = Number(r.cnt); });
+                    const lines = rows.map((r) => `*${r.tournament_id}*: ${r.status} | ${regMap[r.tournament_id] || 0} registered`);
+                    await tgSend(chatId, `📊 *Tournament Status*\n\n${lines.join('\n')}`);
+                }
+                else if (text === '/admin spin') {
+                    await db.query(`UPDATE pf_users SET last_spin_at = NULL WHERE tg_id=$1`, [String(chatId)]);
+                    await tgSend(chatId, `✅ Daily spin reset. Open the app to spin!`, { reply_markup: PLAY_BTN });
+                }
+                else if (text?.startsWith('/admin lookup ')) {
+                    // /admin lookup <name_or_username>
+                    const q = text.split(' ').slice(2).join(' ').trim();
+                    const { rows } = await db.query(`SELECT tg_id, first_name, username, chips, hands_played, referred_by, referral_credited, referral_bonus
            FROM pf_users WHERE first_name ILIKE $1 OR username ILIKE $1 LIMIT 5`, [`%${q}%`]);
-                if (!rows.length) {
-                    await tgSend(chatId, `❌ No users found for "${q}"`);
-                }
-                else {
-                    const lines = rows.map((r) => `*${r.first_name}* (@${r.username || '—'}) id: \`${r.tg_id}\`\n` +
-                        `chips: ${r.chips?.toLocaleString()} | hands: ${r.hands_played}\n` +
-                        `referred_by: ${r.referred_by || '—'} | bonus: ${r.referral_bonus || 0} | credited: ${r.referral_credited}`);
-                    await tgSend(chatId, `🔍 *Found ${rows.length} user(s):*\n\n${lines.join('\n\n')}`);
-                }
-            }
-            else if (text?.startsWith('/admin referral ')) {
-                // /admin referral <tg_id> <referrer_id> — manually set referral for existing user
-                const parts = text.split(' ');
-                const targetId = parts[2]?.trim();
-                const referrerId2 = parts[3]?.trim();
-                if (!targetId || !referrerId2) {
-                    await tgSend(chatId, '❌ Usage: /admin referral <user_tg_id> <referrer_tg_id>');
-                }
-                else {
-                    // Check target exists
-                    const { rows: targetRows } = await db.query('SELECT tg_id, first_name, referred_by, referral_bonus, referral_credited FROM pf_users WHERE tg_id=$1', [targetId]);
-                    if (!targetRows[0]) {
-                        await tgSend(chatId, `❌ User ${targetId} not found`);
+                    if (!rows.length) {
+                        await tgSend(chatId, `No users found for "${q}"`, { parse_mode: undefined });
                     }
                     else {
-                        const u = targetRows[0];
-                        // Set referred_by and bonus (only if not already credited)
-                        const { rows: updated } = await db.query(`UPDATE pf_users SET
+                        const lines = rows.map((r) => `${r.first_name} (@${r.username || '-'}) id: ${r.tg_id}\n` +
+                            `chips: ${(r.chips || 0).toLocaleString()} | hands: ${r.hands_played}\n` +
+                            `referred_by: ${r.referred_by || '-'} | bonus: ${r.referral_bonus || 0} | credited: ${r.referral_credited}`);
+                        await tgSend(chatId, `Found ${rows.length} user(s):\n\n${lines.join('\n\n')}`, { parse_mode: undefined });
+                    }
+                }
+                else if (text?.startsWith('/admin referral ')) {
+                    // /admin referral <tg_id> <referrer_id> — manually set referral for existing user
+                    const parts = text.split(' ');
+                    const targetId = parts[2]?.trim();
+                    const referrerId2 = parts[3]?.trim();
+                    if (!targetId || !referrerId2) {
+                        await tgSend(chatId, '❌ Usage: /admin referral <user_tg_id> <referrer_tg_id>');
+                    }
+                    else {
+                        // Check target exists
+                        const { rows: targetRows } = await db.query('SELECT tg_id, first_name, referred_by, referral_bonus, referral_credited FROM pf_users WHERE tg_id=$1', [targetId]);
+                        if (!targetRows[0]) {
+                            await tgSend(chatId, `❌ User ${targetId} not found`);
+                        }
+                        else {
+                            const u = targetRows[0];
+                            // Set referred_by and bonus (only if not already credited)
+                            const { rows: updated } = await db.query(`UPDATE pf_users SET
                  referred_by = $1,
                  referral_bonus = CASE WHEN referral_bonus IS NULL OR referral_bonus = 0 THEN $2 ELSE referral_bonus END
                WHERE tg_id=$3 AND NOT referral_credited
                RETURNING first_name, referred_by, referral_bonus`, [referrerId2, 3000, targetId] // default premium bonus for Kseniya
-                        );
-                        if (!updated[0]) {
-                            await tgSend(chatId, `⚠️ ${u.first_name} already has referral credited or not found`);
-                        }
-                        else {
-                            await tgSend(chatId, `✅ Referral set for *${updated[0].first_name}*\n` +
-                                `referred_by: ${updated[0].referred_by}\n` +
-                                `bonus queued: ${updated[0].referral_bonus} chips (will credit on next hand)`);
+                            );
+                            if (!updated[0]) {
+                                await tgSend(chatId, `⚠️ ${u.first_name} already has referral credited or not found`);
+                            }
+                            else {
+                                await tgSend(chatId, `✅ Referral set for *${updated[0].first_name}*\n` +
+                                    `referred_by: ${updated[0].referred_by}\n` +
+                                    `bonus queued: ${updated[0].referral_bonus} chips (will credit on next hand)`);
+                            }
                         }
                     }
                 }
-            }
-            else if (text === '/admin sf clean') {
-                // Refund all players in waiting/ready SF sessions, then delete sessions
-                const { rows: regs } = await db.query(`
+                else if (text === '/admin sf clean') {
+                    // Refund all players in waiting/ready SF sessions, then delete sessions
+                    const { rows: regs } = await db.query(`
           SELECT r.tg_id, s.room_id, s.id AS session_id
           FROM pf_sf_registrations r
           JOIN pf_sf_sessions s ON s.id = r.session_id
           WHERE s.status IN ('waiting','ready')
         `);
-                let refunded = 0;
-                for (const reg of regs) {
-                    const cfg = spinFlip_1.SF_CONFIGS[reg.room_id];
-                    if (!cfg)
-                        continue;
-                    await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2', [cfg.buyIn, reg.tg_id]);
-                    await (0, db_1.logTransaction)(reg.tg_id, 'sf_cancel', cfg.buyIn, `Admin SF cleanup refund: ${cfg.name}`);
-                    refunded++;
-                }
-                await db.query(`
+                    let refunded = 0;
+                    for (const reg of regs) {
+                        const cfg = spinFlip_1.SF_CONFIGS[reg.room_id];
+                        if (!cfg)
+                            continue;
+                        await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2', [cfg.buyIn, reg.tg_id]);
+                        await (0, db_1.logTransaction)(reg.tg_id, 'sf_cancel', cfg.buyIn, `Admin SF cleanup refund: ${cfg.name}`);
+                        refunded++;
+                    }
+                    await db.query(`
           DELETE FROM pf_sf_registrations WHERE session_id IN (
             SELECT id FROM pf_sf_sessions WHERE status IN ('waiting','ready')
           )
         `);
-                await db.query(`DELETE FROM pf_sf_sessions WHERE status IN ('waiting','ready')`);
-                await tgSend(chatId, `✅ SF cleaned: refunded *${refunded}* players, all waiting/ready sessions deleted`);
+                    await db.query(`DELETE FROM pf_sf_sessions WHERE status IN ('waiting','ready')`);
+                    await tgSend(chatId, `✅ SF cleaned: refunded *${refunded}* players, all waiting/ready sessions deleted`);
+                }
+                else if (text === '/admin') {
+                    await tgSend(chatId, `🔧 *Admin Commands*\n\n` +
+                        `/admin start daily — force start Daily tournament\n` +
+                        `/admin start weekly — force start Weekly tournament\n` +
+                        `/admin end daily — reset tournament to pending\n` +
+                        `/admin stats — tournament & registration status\n` +
+                        `/admin spin — reset daily spin for yourself\n` +
+                        `/admin lookup <name> — find user by name/username\n` +
+                        `/admin referral <user_id> <referrer_id> — manually set referral\n` +
+                        `/admin credit <tgId> <amount> [reason] — credit chips\n` +
+                        `/admin sf clean — refund all SF registrations & clear stale sessions`);
+                }
             }
-            else if (text === '/admin') {
-                await tgSend(chatId, `🔧 *Admin Commands*\n\n` +
-                    `/admin start daily — force start Daily tournament\n` +
-                    `/admin start weekly — force start Weekly tournament\n` +
-                    `/admin end daily — reset tournament to pending\n` +
-                    `/admin stats — tournament & registration status\n` +
-                    `/admin spin — reset daily spin for yourself\n` +
-                    `/admin lookup <name> — find user by name/username\n` +
-                    `/admin referral <user_id> <referrer_id> — manually set referral\n` +
-                    `/admin credit <tgId> <amount> [reason] — credit chips\n` +
-                    `/admin sf clean — refund all SF registrations & clear stale sessions`);
+            catch (adminErr) {
+                console.error('Admin command error:', adminErr);
+                await tgSend(chatId, `⚠️ Error: ${String(adminErr)}`, { parse_mode: undefined });
             }
         }
     }

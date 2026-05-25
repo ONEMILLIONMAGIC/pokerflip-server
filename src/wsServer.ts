@@ -24,6 +24,20 @@ const sfBlindPendingNotified = new Set<string>()
 const sfEndedTables = new Set<string>()
 const sfPrizes = new Map<string, number>() // tableId → prize amount
 const afkMode = new Set<string>()
+const sitOutSet = new Set<string>() // tableId:playerId
+const afkRequestTimers = new Map<string, NodeJS.Timeout>() // tableId:playerId → auto-clear timer
+const tableGifts = new Map<string, Map<string, { giftId: string; tint: string; fromName: string }>>() // tableId → targetId → gift
+
+const BOMB_PRICES: Record<string, number> = {
+  tomato: 50, banana: 100, egg: 100, ice: 200, fish: 250,
+  pie: 300, brick: 500, cactus: 750, skull: 1000, bomb: 2500,
+}
+const GIFT_PRICES: Record<string, number> = {
+  rose: 100, heart: 200, cake: 300, cocktail: 400, cigar: 500,
+  shades: 600, lightning: 750, fire: 800, star: 1000, champagne: 1500,
+  cards: 1800, money: 2500, chips: 3000, rocket: 5000, watch: 7500,
+  ring: 10000, trophy: 15000, diamond: 25000, ace_pendant: 50000, crown: 100000,
+}
 
 const TABLE_CONFIG: Record<string, { sb: number; bb: number; minBuyIn: number; maxPlayers?: number }> = {
   main:     { sb: 10,  bb: 20,  minBuyIn: 400 },
@@ -128,12 +142,20 @@ function canAutoRunBoard(state: GameState): boolean {
 
 // ─── Single post-showdown scheduler (replaces 4+ duplicate blocks) ────────────
 
+function clearTableGifts(tableId: string) {
+  if (tableGifts.has(tableId)) {
+    tableGifts.delete(tableId)
+    broadcastToTable(tableId, { type: 'gift_clear' })
+  }
+}
+
 function scheduleNextHand(tableId: string, delay = 4000) {
   setTimeout(() => {
     if (sfEndedTables.has(tableId)) return
     const s = tables.get(tableId)
     if (!s) return
     if (canStartTable(tableId, s)) {
+      clearTableGifts(tableId)
       applySFBlindsIfDue(tableId, s)
       if (getSFRoomId(tableId)) startSFHand(s)
       else startHand(s)
@@ -542,6 +564,85 @@ function handleMessage(ws: WebSocket, msg: any) {
     return
   }
 
+  if (type === 'sit_out') {
+    sitOutSet.add(`${tableId}:${playerId}`)
+    afkMode.add(`${tableId}:${playerId}`)
+    return
+  }
+
+  if (type === 'sit_in') {
+    sitOutSet.delete(`${tableId}:${playerId}`)
+    afkMode.delete(`${tableId}:${playerId}`)
+    send(ws, { type: 'here_ok' })
+    return
+  }
+
+  if (type === 'afk_request') {
+    const duration = Math.min(Math.max(Number(msg.duration) || 300, 60), 600)
+    const key = `${tableId}:${playerId}`
+    afkMode.add(key)
+    send(ws, { type: 'you_are_afk' })
+    const existing = afkRequestTimers.get(key)
+    if (existing) clearTimeout(existing)
+    afkRequestTimers.set(key, setTimeout(() => {
+      afkRequestTimers.delete(key)
+      afkMode.delete(key)
+      const ws2 = [...clients.entries()].find(([, c]) => c.playerId === playerId && c.tableId === tableId)?.[0]
+      if (ws2) send(ws2, { type: 'here_ok' })
+    }, duration * 1000))
+    return
+  }
+
+  if (type === 'send_bomb') {
+    const bombId = String(msg.bombId || '').slice(0, 32)
+    const tint = String(msg.tint || '#FF4D6D').slice(0, 16)
+    const targetId = String(msg.targetId || '').slice(0, 64)
+    const price = BOMB_PRICES[bombId] ?? 0
+    const bankKey = `${tableId}:${playerId}`
+    const bank = playerBanks.get(bankKey) ?? 0
+    if (!price || bank < price) {
+      send(ws, { type: 'error', code: 'insufficient_chips', message: 'Not enough chips in bank', have: bank, required: price })
+      return
+    }
+    const newBank = bank - price
+    playerBanks.set(bankKey, newBank)
+    if (process.env.DATABASE_URL) {
+      getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => {})
+    }
+    send(ws, { type: 'bank_update', bank: newBank })
+    broadcastToTable(tableId, {
+      type: 'bomb_event', fromId: playerId, fromName: client.playerName,
+      targetId, bombId, tint,
+    })
+    return
+  }
+
+  if (type === 'send_gift') {
+    const giftId = String(msg.giftId || '').slice(0, 32)
+    const tint = String(msg.tint || '#00FFB0').slice(0, 16)
+    const targetId = String(msg.targetId || '').slice(0, 64)
+    const price = GIFT_PRICES[giftId] ?? 0
+    const bankKey = `${tableId}:${playerId}`
+    const bank = playerBanks.get(bankKey) ?? 0
+    if (!price || bank < price) {
+      send(ws, { type: 'error', code: 'insufficient_chips', message: 'Not enough chips in bank', have: bank, required: price })
+      return
+    }
+    const newBank = bank - price
+    playerBanks.set(bankKey, newBank)
+    if (process.env.DATABASE_URL) {
+      getPool().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => {})
+    }
+    send(ws, { type: 'bank_update', bank: newBank })
+    if (!tableGifts.has(tableId)) tableGifts.set(tableId, new Map())
+    tableGifts.get(tableId)!.set(targetId, { giftId, tint, fromName: client.playerName })
+    broadcastToTable(tableId, {
+      type: 'gift_event', fromId: playerId, fromName: client.playerName,
+      targetId, giftId, tint,
+    })
+    return
+  }
+
   if (type === 'ping') {
     send(ws, { type: 'pong' })
     return
@@ -570,6 +671,9 @@ function handleDisconnect(ws: WebSocket) {
   }
 
   afkMode.delete(`${tableId}:${playerId}`)
+  sitOutSet.delete(`${tableId}:${playerId}`)
+  const afkReqTimer = afkRequestTimers.get(`${tableId}:${playerId}`)
+  if (afkReqTimer) { clearTimeout(afkReqTimer); afkRequestTimers.delete(`${tableId}:${playerId}`) }
   removePlayer(state, playerId)
   tables.set(tableId, state)
   broadcastTable(tableId)
@@ -789,6 +893,9 @@ async function checkSFEnd(state: GameState) {
     if (st) { clearTimeout(st); startTimers.delete(tableId) }
     for (const key of [...playerBanks.keys()]) { if (key.startsWith(`${tableId}:`)) playerBanks.delete(key) }
     for (const key of [...afkMode]) { if (key.startsWith(`${tableId}:`)) afkMode.delete(key) }
+    for (const key of [...sitOutSet]) { if (key.startsWith(`${tableId}:`)) sitOutSet.delete(key) }
+    for (const key of [...afkRequestTimers.keys()]) { if (key.startsWith(`${tableId}:`)) { clearTimeout(afkRequestTimers.get(key)!); afkRequestTimers.delete(key) } }
+    tableGifts.delete(tableId)
     runoutTables.delete(tableId)
   }, 9000)
 }
