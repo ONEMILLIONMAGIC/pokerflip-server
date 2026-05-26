@@ -693,7 +693,7 @@ app.post('/api/auth', async (req, res) => {
 
     // Update login streak (no chip bonus, just counter for achievements)
     const today = new Date().toISOString().slice(0, 10)
-    const lastLogin = user.last_login_date ? String(user.last_login_date).slice(0, 10) : null
+    const lastLogin = user.last_login_date ? new Date(user.last_login_date).toISOString().slice(0, 10) : null
     if (lastLogin !== today) {
       const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
       const newStreak = lastLogin === yesterday ? (user.streak_days || 0) + 1 : 1
