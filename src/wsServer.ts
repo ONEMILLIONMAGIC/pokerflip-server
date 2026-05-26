@@ -18,6 +18,7 @@ const actionTimers = new Map<string, NodeJS.Timeout>()
 const afkTimers = new Map<string, NodeJS.Timeout>()
 const playerBanks = new Map<string, number>()
 const runoutTables = new Set<string>()
+const lastTurnNotif = new Map<string, number>() // playerId → timestamp
 
 const sfBlinds = new Map<string, { level: number; sb: number; bb: number; nextAt: number }>()
 const sfBlindPendingNotified = new Set<string>()
@@ -225,6 +226,27 @@ function clearActionTimer(tableId: string) {
   if (t) { clearTimeout(t); actionTimers.delete(tableId) }
 }
 
+async function sendTurnNotification(playerId: string, tableId: string) {
+  const botToken = process.env.BOT_TOKEN
+  if (!botToken) return
+  // Rate limit: once per 30s per player
+  const now = Date.now()
+  if ((lastTurnNotif.get(playerId) ?? 0) > now - 30_000) return
+  lastTurnNotif.set(playerId, now)
+  // Only send if player has no open WS connection (TMA is closed/backgrounded)
+  const hasWs = [...clients.values()].some(c => c.playerId === playerId && c.tableId === tableId)
+  if (hasWs) return
+  const tableName = tableId.replace(/_/g, ' ')
+  await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: playerId,
+      text: `🃏 *Ваш ход!*\nСтол: ${tableName}\n[Открыть игру](https://t.me/pokerflip_bot/play)`,
+      parse_mode: 'Markdown',
+    })
+  }).catch(() => {})
+}
+
 function setActionTimer(tableId: string) {
   clearActionTimer(tableId)
   if (runoutTables.has(tableId)) return
@@ -251,6 +273,9 @@ function setActionTimer(tableId: string) {
     actionTimers.set(tableId, setTimeout(() => autoFoldPlayer(tableId, p.id, false), 800))
     return
   }
+
+  // Push notification if player's TMA is not focused (no active WS from them in last 8s)
+  sendTurnNotification(p.id, tableId).catch(() => {})
 
   // Normal timer
   actionTimers.set(tableId, setTimeout(() => {
