@@ -351,12 +351,26 @@ app.get('/api/notify', async (req, res) => {
   }
 })
 
-app.get('/tables', (_req, res) => {
+// Track lobby-active users by tgId (last seen within 90s)
+const lobbyActive = new Map<string, number>() // tgId → timestamp
+
+app.get('/tables', (req, res) => {
+  // Mark caller as lobby-active if they send tgId query param
+  const tgId = req.query.tgId as string | undefined
+  if (tgId) lobbyActive.set(tgId, Date.now())
+  // Purge stale entries
+  const cutoff = Date.now() - 90_000
+  for (const [id, ts] of lobbyActive) if (ts < cutoff) lobbyActive.delete(id)
   res.json(getTableStats())
 })
 
 app.get('/api/online', (_req, res) => {
-  res.json({ online: getOnlineCount() })
+  const stats = getTableStats()
+  const atTables = Object.values(stats).reduce((s, t) => s + t.players, 0)
+  const cutoff = Date.now() - 90_000
+  for (const [id, ts] of lobbyActive) if (ts < cutoff) lobbyActive.delete(id)
+  const inLobby = lobbyActive.size
+  res.json({ atTables, inLobby, total: atTables + inLobby })
 })
 
 const MIN_PLAYERS = 6
