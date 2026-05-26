@@ -461,7 +461,7 @@ function scheduleStart(tableId: string) {
   if (startTimers.has(tableId)) return
   if (sfEndedTables.has(tableId)) return
 
-  const delay = getSFRoomId(tableId) ? 13500 : 4500
+  const delay = getSFRoomId(tableId) ? 15000 : 4500
   if (getSFRoomId(tableId)) sfHandStartsAt.set(tableId, Date.now() + delay)
 
   const timer = setTimeout(() => {
