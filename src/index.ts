@@ -792,6 +792,11 @@ app.post('/api/claim-mission', async (req, res) => {
       won_bluff:  { chips: 125, label: 'Win by Bluff' },
       win_allin:  { chips: 200, label: 'Win an All-In' },
       big_pot:    { chips: 175, label: 'Win a Big Pot' },
+      spin_daily: { chips: 75,  label: 'Daily Spin' },
+      sf_played:  { chips: 100, label: 'Play Spin & Flip' },
+      sf_won:     { chips: 300, label: 'Win Spin & Flip' },
+      tourn_reg:  { chips: 100, label: 'Join Tournament' },
+      tourn_won:  { chips: 500, label: 'Win Tournament' },
     }
     const reward = REWARDS[missionId]
     if (!reward) return res.status(400).json({ error: 'unknown mission' })
