@@ -176,4 +176,9 @@ export async function initDB() {
       PRIMARY KEY (tg_id, mission_id, claim_date)
     )
   `)
+  // Anti-cheat: suspicious flag for chip dumping detection
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS suspicious BOOLEAN NOT NULL DEFAULT FALSE`).catch(() => {})
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS suspicious_reason TEXT`).catch(() => {})
+  // Index for hand history per-player lookup
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_hand_history_created ON pf_hand_history(created_at DESC)`).catch(() => {})
 }

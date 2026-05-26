@@ -1205,12 +1205,56 @@ app.get('/api/player-ranks', async (req, res) => {
     if (!ids.length) return res.json([])
     const db = getPool()
     const { rows } = await db.query(
-      `SELECT tg_id, hands_played, hands_won, biggest_pot, tournaments_won, streak_days
+      `SELECT tg_id, hands_played, hands_won, biggest_pot, tournaments_won, streak_days, suspicious
        FROM pf_users WHERE tg_id = ANY($1)`,
       [ids]
     )
     res.json(rows)
   } catch { res.json([]) }
+})
+
+// GET /api/my-hands?tgId=xxx — last 20 hands the player participated in
+app.get('/api/my-hands', async (req, res) => {
+  try {
+    const tgId = (req.query.tgId as string || '').trim()
+    if (!tgId) return res.json([])
+    const db = getPool()
+    const { rows } = await db.query(
+      `SELECT id, table_id, board, players, winners, pot, created_at
+       FROM pf_hand_history
+       WHERE players::text LIKE $1
+       ORDER BY created_at DESC LIMIT 20`,
+      [`%"id":"${tgId}"%`]
+    )
+    // Return only relevant player slice to keep payload small
+    const result = rows.map((r: any) => {
+      const players: any[] = r.players
+      const me = players.find((p: any) => p.id === tgId)
+      return {
+        id: r.id, tableId: r.table_id, pot: r.pot, createdAt: r.created_at,
+        board: r.board,
+        won: me?.won ?? false, wonAmount: me?.wonAmount ?? 0,
+        hand: me?.hand ?? '', folded: me?.folded ?? false,
+        holeCards: me?.holeCards ?? [],
+        winners: r.winners,
+      }
+    })
+    res.json(result)
+  } catch { res.json([]) }
+})
+
+// GET /api/admin/suspicious — list flagged players (admin only)
+app.get('/api/admin/suspicious', async (req, res) => {
+  const secret = req.headers['x-admin-secret']
+  if (!secret || secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'forbidden' })
+  try {
+    const db = getPool()
+    const { rows } = await db.query(
+      `SELECT tg_id, first_name, username, chips, suspicious_reason, hands_played, hands_won, created_at
+       FROM pf_users WHERE suspicious=TRUE ORDER BY created_at DESC`
+    )
+    res.json(rows)
+  } catch { res.status(500).json({ error: 'db error' }) }
 })
 
 // POST /api/admin/credit — manual chip credit (protected by ADMIN_SECRET)

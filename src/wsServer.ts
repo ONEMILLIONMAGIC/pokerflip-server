@@ -1011,8 +1011,57 @@ async function saveHandStats(state: GameState) {
     }))), JSON.stringify(state.winners), state.winners.reduce((s, w) => s + w.amount, 0)]
   ).catch(() => {})
 
+  // Chip dump detection: soft, non-blocking
+  if (!isSF && !TOURNAMENT_TABLE_IDS.has(state.tableId)) {
+    checkChipDump(state).catch(() => {})
+  }
+
   if (TOURNAMENT_TABLE_IDS.has(state.tableId)) await checkTournamentEnd(state).catch(console.error)
   if (isSF) await checkSFEnd(state).catch(console.error)
+}
+
+async function checkChipDump(state: GameState) {
+  if (!process.env.DATABASE_URL) return
+  const db = getPool()
+  const winnerIds = new Set(state.winners.map(w => w.playerId))
+  const losers = state.players.filter(p => !winnerIds.has(p.id) && !p.folded && p.holeCards?.some(c => (c.rank as string) !== '?'))
+  if (!losers.length || state.winners.length !== 1) return
+  const winnerId = state.winners[0].playerId
+
+  for (const loser of losers) {
+    if (loser.id === winnerId) continue
+    // Get last 12 hands at this table involving both players
+    const { rows } = await db.query(
+      `SELECT players FROM pf_hand_history
+       WHERE table_id=$1 AND players::text LIKE $2 AND players::text LIKE $3
+       ORDER BY created_at DESC LIMIT 12`,
+      [state.tableId, `%"id":"${loser.id}"%`, `%"id":"${winnerId}"%`]
+    ).catch(() => ({ rows: [] as any[] }))
+
+    if (rows.length < 6) continue
+
+    let loserLostCount = 0
+    let totalLost = 0
+    for (const row of rows) {
+      const players: any[] = row.players
+      const loserEntry = players.find((p: any) => p.id === loser.id)
+      const winnerEntry = players.find((p: any) => p.id === winnerId)
+      if (!loserEntry || !winnerEntry) continue
+      if (!loserEntry.won && winnerEntry.won) {
+        loserLostCount++
+        totalLost += winnerEntry.wonAmount || 0
+      }
+    }
+
+    const lossRate = loserLostCount / rows.length
+    // Flag if lost to same player in 75%+ of hands AND transferred significant chips
+    if (lossRate >= 0.75 && totalLost >= 5000) {
+      await db.query(
+        `UPDATE pf_users SET suspicious=TRUE, suspicious_reason=$1 WHERE tg_id=$2 AND suspicious=FALSE`,
+        [`Lost ${Math.round(lossRate*100)}% of ${rows.length} hands to same player (${totalLost} chips) at ${state.tableId}`, loser.id]
+      ).catch(() => {})
+    }
+  }
 }
 
 async function checkTournamentEnd(state: GameState) {
