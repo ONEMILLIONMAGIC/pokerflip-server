@@ -1197,6 +1197,22 @@ app.get('/api/balance', async (req, res) => {
   }
 })
 
+// GET /api/player-ranks?ids=id1,id2,... — return rank data for multiple players (for table badges)
+app.get('/api/player-ranks', async (req, res) => {
+  try {
+    const raw = (req.query.ids as string) || ''
+    const ids = raw.split(',').map(s => s.trim()).filter(Boolean).slice(0, 10)
+    if (!ids.length) return res.json([])
+    const db = getPool()
+    const { rows } = await db.query(
+      `SELECT tg_id, hands_played, hands_won, biggest_pot, tournaments_won, streak_days
+       FROM pf_users WHERE tg_id = ANY($1)`,
+      [ids]
+    )
+    res.json(rows)
+  } catch { res.json([]) }
+})
+
 // POST /api/admin/credit — manual chip credit (protected by ADMIN_SECRET)
 app.post('/api/admin/credit', async (req, res) => {
   const secret = req.headers['x-admin-secret']
