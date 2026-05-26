@@ -967,7 +967,8 @@ async function checkSFEnd(state: GameState) {
   })
   if (!result) return
 
-  broadcastToTable(tableId, { type: 'tournament_end', winnerId: winner.id, winnerName: winner.name, prize: result.prize, tableId })
+  const winnerHand = state.winners.find(w => w.playerId === winner.id)?.hand || ''
+  broadcastToTable(tableId, { type: 'tournament_end', winnerId: winner.id, winnerName: winner.name, prize: result.prize, tableId, winnerHand })
 
   setTimeout(() => {
     tables.delete(tableId)

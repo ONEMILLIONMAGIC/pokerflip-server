@@ -1222,9 +1222,9 @@ app.get('/api/my-hands', async (req, res) => {
     const { rows } = await db.query(
       `SELECT id, table_id, board, players, winners, pot, created_at
        FROM pf_hand_history
-       WHERE players::text LIKE $1
+       WHERE players @> $1::jsonb
        ORDER BY created_at DESC LIMIT 20`,
-      [`%"id":"${tgId}"%`]
+      [JSON.stringify([{ id: tgId }])]
     )
     // Return only relevant player slice to keep payload small
     const result = rows.map((r: any) => {
