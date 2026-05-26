@@ -1145,6 +1145,10 @@ async function checkTournamentEnd(state: GameState) {
 
 // ─── HTTP stats ───────────────────────────────────────────────────────────────
 
+export function getOnlineCount(): number {
+  return clients.size
+}
+
 export function getTableStats(): Record<string, { players: number; maxPlayers: number; street: string }> {
   const stats: Record<string, { players: number; maxPlayers: number; street: string }> = {}
   for (const [tableId, state] of tables) {

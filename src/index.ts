@@ -3,7 +3,7 @@ import { createServer } from 'http'
 import { WebSocketServer } from 'ws'
 import cors from 'cors'
 import dotenv from 'dotenv'
-import { setupWS, getTableStats } from './wsServer'
+import { setupWS, getTableStats, getOnlineCount } from './wsServer'
 import { initDB, getPool, logTransaction } from './db'
 import { getAchievements } from './achievements'
 import { validateTgInitData, parseTgUser } from './utils'
@@ -353,6 +353,10 @@ app.get('/api/notify', async (req, res) => {
 
 app.get('/tables', (_req, res) => {
   res.json(getTableStats())
+})
+
+app.get('/api/online', (_req, res) => {
+  res.json({ online: getOnlineCount() })
 })
 
 const MIN_PLAYERS = 6
