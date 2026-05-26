@@ -6,6 +6,7 @@ const ws_1 = require("ws");
 const game_1 = require("./engine/game");
 const db_1 = require("./db");
 const spinFlip_1 = require("./spinFlip");
+const handEval_1 = require("./engine/handEval");
 const tables = new Map();
 const clients = new Map();
 const startTimers = new Map();
@@ -18,6 +19,7 @@ const sfBlinds = new Map();
 const sfBlindPendingNotified = new Set();
 const sfEndedTables = new Set();
 const sfPrizes = new Map(); // tableId → prize amount
+const sfHandStartsAt = new Map(); // tableId → epoch ms when hand will start
 const afkMode = new Set();
 const sitOutSet = new Set(); // tableId:playerId
 const afkRequestTimers = new Map(); // tableId:playerId → auto-clear timer
@@ -469,8 +471,12 @@ function scheduleStart(tableId) {
         return;
     if (sfEndedTables.has(tableId))
         return;
+    const delay = (0, spinFlip_1.getSFRoomId)(tableId) ? 15000 : 4500;
+    if ((0, spinFlip_1.getSFRoomId)(tableId))
+        sfHandStartsAt.set(tableId, Date.now() + delay);
     const timer = setTimeout(() => {
         startTimers.delete(tableId);
+        sfHandStartsAt.delete(tableId);
         if (sfEndedTables.has(tableId))
             return;
         let state = tables.get(tableId);
@@ -492,7 +498,7 @@ function scheduleStart(tableId) {
         tables.set(tableId, state);
         broadcastTable(tableId);
         setActionTimer(tableId);
-    }, (0, spinFlip_1.getSFRoomId)(tableId) ? 13500 : 4500);
+    }, delay);
     startTimers.set(tableId, timer);
 }
 // ─── Broadcast ────────────────────────────────────────────────────────────────
@@ -511,6 +517,9 @@ function broadcastTable(tableId) {
         const msg = { type: 'state', state: masked };
         if (sfPrize !== undefined)
             msg.sfPrize = sfPrize;
+        const startsAt = sfHandStartsAt.get(tableId);
+        if (startsAt !== undefined)
+            msg.sfHandStartsAt = startsAt;
         send(ws, msg);
     }
 }
@@ -1052,11 +1061,22 @@ async function saveHandStats(state) {
             await (0, db_1.logTransaction)(row.referred_by, 'referral', bonus, `Referral bonus: ${player.id} completed 10 hands`);
         }
     }
-    db.query(`INSERT INTO pf_hand_history (table_id, board, players, winners, pot) VALUES ($1,$2,$3,$4,$5)`, [state.tableId, JSON.stringify(state.board), JSON.stringify(state.players.filter(p => p.holeCards?.length).map(p => ({
-            id: p.id, name: p.name, holeCards: p.holeCards, folded: p.folded,
-            won: winnerIds.has(p.id), wonAmount: state.winners.find(w => w.playerId === p.id)?.amount || 0,
-            hand: state.winners.find(w => w.playerId === p.id)?.hand || '',
-        }))), JSON.stringify(state.winners), state.winners.reduce((s, w) => s + w.amount, 0)]).catch(() => { });
+    const boardForEval = state.board.filter(c => c.rank !== '?');
+    db.query(`INSERT INTO pf_hand_history (table_id, board, players, winners, pot) VALUES ($1,$2,$3,$4,$5)`, [state.tableId, JSON.stringify(state.board), JSON.stringify(state.players.filter(p => p.holeCards?.length).map(p => {
+            const winnerEntry = state.winners.find(w => w.playerId === p.id);
+            let handName = winnerEntry?.hand || '';
+            if (!handName && !p.folded && boardForEval.length >= 3) {
+                const realHole = p.holeCards.filter(c => c.rank !== '?');
+                if (realHole.length === 2) {
+                    try {
+                        handName = (0, handEval_1.evaluate)([...realHole, ...boardForEval]).name;
+                    }
+                    catch { }
+                }
+            }
+            return { id: p.id, name: p.name, holeCards: p.holeCards, folded: p.folded,
+                won: winnerIds.has(p.id), wonAmount: winnerEntry?.amount || 0, hand: handName };
+        })), JSON.stringify(state.winners), state.winners.reduce((s, w) => s + w.amount, 0)]).catch(() => { });
     // Chip dump detection: soft, non-blocking
     if (!isSF && !TOURNAMENT_TABLE_IDS.has(state.tableId)) {
         checkChipDump(state).catch(() => { });

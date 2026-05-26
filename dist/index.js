@@ -1110,7 +1110,6 @@ app.get('/api/my-hands', async (req, res) => {
        FROM pf_hand_history
        WHERE players @> $1::jsonb
        ORDER BY created_at DESC LIMIT 20`, [JSON.stringify([{ id: tgId }])]);
-        // Return only relevant player slice to keep payload small
         const result = rows.map((r) => {
             const players = r.players;
             const me = players.find((p) => p.id === tgId);
@@ -1120,7 +1119,12 @@ app.get('/api/my-hands', async (req, res) => {
                 won: me?.won ?? false, wonAmount: me?.wonAmount ?? 0,
                 hand: me?.hand ?? '', folded: me?.folded ?? false,
                 holeCards: me?.holeCards ?? [],
-                winners: r.winners,
+                // All players with their cards and result
+                players: players.map((p) => ({
+                    id: p.id, name: p.name, holeCards: p.holeCards ?? [],
+                    won: p.won ?? false, wonAmount: p.wonAmount ?? 0,
+                    hand: p.hand ?? '', folded: p.folded ?? false,
+                })),
             };
         });
         res.json(result);

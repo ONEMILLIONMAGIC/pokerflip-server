@@ -212,12 +212,12 @@ export function advanceStreet(s: GameState): GameState {
   return s
 }
 
-function calculatePots(players: Player[]): { amount: number; eligible: string[] }[] {
+function calculatePots(players: Player[]): { amount: number; eligible: string[]; refund: boolean }[] {
   const contributors = players.filter(p => p.totalBet > 0)
   if (contributors.length === 0) return []
 
   const levels = [...new Set(contributors.map(p => p.totalBet))].sort((a, b) => a - b)
-  const pots: { amount: number; eligible: string[] }[] = []
+  const pots: { amount: number; eligible: string[]; refund: boolean }[] = []
   let prev = 0
 
   for (const level of levels) {
@@ -225,7 +225,8 @@ function calculatePots(players: Player[]): { amount: number; eligible: string[] 
     const numContributors = contributors.filter(p => p.totalBet >= level).length
     const potAmount = contribution * numContributors
     const eligible = players.filter(p => !p.folded && p.totalBet >= level).map(p => p.id)
-    if (potAmount > 0) pots.push({ amount: potAmount, eligible })
+    // refund = only one player ever put money at this level (uncalled excess)
+    if (potAmount > 0) pots.push({ amount: potAmount, eligible, refund: numContributors === 1 })
     prev = level
   }
 
@@ -249,9 +250,13 @@ function resolveShowdown(s: GameState): GameState {
 
     if (eligible.length === 1) {
       eligible[0].chips += pot.amount
-      const e = winnerMap.get(eligible[0].id)
-      if (e) e.amount += pot.amount
-      else winnerMap.set(eligible[0].id, { amount: pot.amount, hand: 'Last standing' })
+      if (!pot.refund) {
+        // Others contributed but folded — legitimate uncontested win
+        const e = winnerMap.get(eligible[0].id)
+        if (e) e.amount += pot.amount
+        else winnerMap.set(eligible[0].id, { amount: pot.amount, hand: 'Last standing' })
+      }
+      // refund === true: player's own uncalled excess returned silently, not a win
       continue
     }
 
