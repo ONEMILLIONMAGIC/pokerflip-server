@@ -197,7 +197,7 @@ function cancelAfkKick(tableId: string, playerId: string) {
   if (t) { clearTimeout(t); afkKickTimers.delete(`${tableId}:${playerId}`) }
 }
 
-function scheduleNextHand(tableId: string, delay = 4000) {
+function scheduleNextHand(tableId: string, delay = 4500) {
   setTimeout(() => {
     if (sfEndedTables.has(tableId)) return
     const s = tables.get(tableId)
@@ -283,7 +283,7 @@ function autoFoldPlayer(tableId: string, playerId: string, isTimed: boolean) {
   st = tables.get(tableId)!
   if (st.street === 'showdown') {
     saveHandStats(st).catch(console.error)
-    scheduleNextHand(tableId, isTimed ? 4000 : 2000)
+    scheduleNextHand(tableId, isTimed ? 4500 : 4500)
   } else {
     setActionTimer(tableId)
   }
@@ -306,7 +306,7 @@ function foldDisconnectedPlayers(tableId: string) {
   s = tables.get(tableId)!
   if (s.street === 'showdown') {
     saveHandStats(s).catch(console.error)
-    scheduleNextHand(tableId, 2000)
+    scheduleNextHand(tableId, 4500)
   } else {
     setTimeout(() => foldDisconnectedPlayers(tableId), 150)
     setActionTimer(tableId)
@@ -346,7 +346,7 @@ function resolveHandAfterDisconnect(tableId: string) {
     tables.set(tableId, s)
     broadcastTable(tableId)
     saveHandStats(s).catch(console.error)
-    scheduleNextHand(tableId, 2000)
+    scheduleNextHand(tableId, 4500)
   } else if (notFolded.length > 1) {
     tables.set(tableId, s)
     broadcastTable(tableId)
@@ -456,7 +456,7 @@ function scheduleStart(tableId: string) {
     tables.set(tableId, state)
     broadcastTable(tableId)
     setActionTimer(tableId)
-  }, 3000)
+  }, 4500)
   startTimers.set(tableId, timer)
 }
 
