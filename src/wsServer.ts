@@ -25,6 +25,7 @@ const sfBlinds = new Map<string, { level: number; sb: number; bb: number; nextAt
 const sfBlindPendingNotified = new Set<string>()
 const sfEndedTables = new Set<string>()
 const sfPrizes = new Map<string, number>() // tableId → prize amount
+const sfHandStartsAt = new Map<string, number>() // tableId → epoch ms when hand will start
 const afkMode = new Set<string>()
 const sitOutSet = new Set<string>() // tableId:playerId
 const afkRequestTimers = new Map<string, NodeJS.Timeout>() // tableId:playerId → auto-clear timer
@@ -460,8 +461,12 @@ function scheduleStart(tableId: string) {
   if (startTimers.has(tableId)) return
   if (sfEndedTables.has(tableId)) return
 
+  const delay = getSFRoomId(tableId) ? 13500 : 4500
+  if (getSFRoomId(tableId)) sfHandStartsAt.set(tableId, Date.now() + delay)
+
   const timer = setTimeout(() => {
     startTimers.delete(tableId)
+    sfHandStartsAt.delete(tableId)
     if (sfEndedTables.has(tableId)) return
 
     let state = tables.get(tableId)
@@ -482,7 +487,7 @@ function scheduleStart(tableId: string) {
     tables.set(tableId, state)
     broadcastTable(tableId)
     setActionTimer(tableId)
-  }, getSFRoomId(tableId) ? 13500 : 4500)
+  }, delay)
   startTimers.set(tableId, timer)
 }
 
@@ -499,6 +504,8 @@ function broadcastTable(tableId: string) {
     masked.players = masked.players.map((p: any) => ({ ...p, afk: afkMode.has(`${tableId}:${p.id}`) }))
     const msg: any = { type: 'state', state: masked }
     if (sfPrize !== undefined) msg.sfPrize = sfPrize
+    const startsAt = sfHandStartsAt.get(tableId)
+    if (startsAt !== undefined) msg.sfHandStartsAt = startsAt
     send(ws, msg)
   }
 }
