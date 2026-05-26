@@ -304,12 +304,12 @@ app.get('/api/notify', async (req, res) => {
   }
   try {
     const db = getPool()
-    // Users who haven't logged in for 20-48 hours and have claimable chips
+    // Users absent 3+ days, not notified in past 3 days
     const { rows } = await db.query(`
       SELECT tg_id, first_name, chips, claimed_at, last_spin_at, lang
       FROM pf_users
-      WHERE last_login_date < CURRENT_DATE - INTERVAL '1 day'
-        AND last_login_date >= CURRENT_DATE - INTERVAL '3 days'
+      WHERE last_login_date < CURRENT_DATE - INTERVAL '3 days'
+        AND (last_notified_at IS NULL OR last_notified_at < NOW() - INTERVAL '3 days')
       LIMIT 200
     `)
 
@@ -340,6 +340,7 @@ app.get('/api/notify', async (req, res) => {
         NOTIFY_TEXT[lang](u.first_name || (lang === 'ru' ? 'Игрок' : lang === 'it' ? 'Giocatore' : 'Player'), u.chips.toLocaleString(), parts),
         { reply_markup: PLAY_BTN }
       )
+      await db.query(`UPDATE pf_users SET last_notified_at = NOW() WHERE tg_id = $1`, [u.tg_id])
       sent++
       await new Promise(r => setTimeout(r, 100)) // rate limit
     }

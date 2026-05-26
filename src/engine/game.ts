@@ -177,8 +177,14 @@ export function advanceStreet(s: GameState): GameState {
   const notFolded = s.players.filter(p => !p.folded)
 
   if (notFolded.length === 1) {
-    s.winners = [{ playerId: notFolded[0].id, amount: s.pot, hand: 'Last standing' }]
-    notFolded[0].chips += s.pot
+    const winner = notFolded[0]
+    // Return uncalled portion: winner may have raised more than anyone matched
+    const others = s.players.filter(p => p.id !== winner.id && p.totalBet > 0)
+    const maxOtherBet = others.length > 0 ? Math.max(...others.map(p => p.totalBet)) : 0
+    const uncalled = Math.max(0, winner.totalBet - maxOtherBet)
+    const wonAmount = s.pot - uncalled
+    winner.chips += s.pot
+    s.winners = [{ playerId: winner.id, amount: wonAmount, hand: 'Last standing' }]
     s.pot = 0
     s.street = 'showdown'
     return s

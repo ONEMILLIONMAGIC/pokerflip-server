@@ -57,6 +57,8 @@ export async function initDB() {
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS referral_credited BOOLEAN NOT NULL DEFAULT FALSE`).catch(() => {})
   // referral_bonus: how much the referrer earns (3000 for premium-referred, 1000 for regular)
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS referral_bonus INTEGER NOT NULL DEFAULT 1000`).catch(() => {})
+  // last_notified_at: track when push notification was last sent to avoid spam
+  await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS last_notified_at TIMESTAMPTZ`).catch(() => {})
   // lang: user's preferred language (ru/en/it), set on /start from Telegram language_code
   await db.query(`ALTER TABLE pf_users ADD COLUMN IF NOT EXISTS lang VARCHAR(2) NOT NULL DEFAULT 'en'`).catch(() => {})
   // Hand history

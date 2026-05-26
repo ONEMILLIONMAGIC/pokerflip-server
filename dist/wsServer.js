@@ -20,16 +20,17 @@ const sfPrizes = new Map(); // tableId → prize amount
 const afkMode = new Set();
 const sitOutSet = new Set(); // tableId:playerId
 const afkRequestTimers = new Map(); // tableId:playerId → auto-clear timer
+const afkKickTimers = new Map(); // tableId:playerId → 3-min cash-table kick
 const tableGifts = new Map(); // tableId → targetId → gift
 const BOMB_PRICES = {
-    tomato: 50, banana: 100, egg: 100, ice: 200, fish: 250,
+    tomato: 50, banana: 100, egg: 100, poop: 200, fish: 250,
     pie: 300, brick: 500, cactus: 750, skull: 1000, bomb: 2500,
 };
 const GIFT_PRICES = {
     rose: 100, heart: 200, cake: 300, cocktail: 400, cigar: 500,
-    shades: 600, lightning: 750, fire: 800, star: 1000, champagne: 1500,
-    cards: 1800, money: 2500, chips: 3000, rocket: 5000, watch: 7500,
-    ring: 10000, trophy: 15000, diamond: 25000, ace_pendant: 50000, crown: 100000,
+    shades: 600, champagne: 1500, money: 2500,
+    rocket: 5000, watch: 7500, ring: 10000,
+    trophy: 15000, diamond: 25000, ace_pendant: 50000, crown: 100000,
 };
 const TABLE_CONFIG = {
     main: { sb: 10, bb: 20, minBuyIn: 400 },
@@ -117,6 +118,10 @@ function getTableConfig(tableId) {
 function canStartTable(tableId, state) {
     if ((0, spinFlip_1.getSFRoomId)(tableId))
         return state.players.filter(p => p.chips > 0).length >= 2;
+    if (isCashTable(tableId)) {
+        // Cash: need 2+ connected players who are not in AFK mode
+        return state.players.filter(p => p.connected && !afkMode.has(`${tableId}:${p.id}`)).length >= 2;
+    }
     return (0, game_1.canStart)(state);
 }
 function canAutoRunBoard(state) {
@@ -139,7 +144,54 @@ function clearTableGifts(tableId) {
         broadcastToTable(tableId, { type: 'gift_clear' });
     }
 }
-function scheduleNextHand(tableId, delay = 4000) {
+const AFK_KICK_MS = 3 * 60 * 1000; // 3 minutes
+function isCashTable(tableId) {
+    return !(0, spinFlip_1.getSFRoomId)(tableId) && !TOURNAMENT_TABLE_IDS.has(tableId);
+}
+function kickAfkPlayer(tableId, playerId) {
+    afkKickTimers.delete(`${tableId}:${playerId}`);
+    afkMode.delete(`${tableId}:${playerId}`);
+    const state = tables.get(tableId);
+    if (!state)
+        return;
+    const player = state.players.find(p => p.id === playerId);
+    if (!player)
+        return;
+    const bank = playerBanks.get(`${tableId}:${playerId}`) ?? 0;
+    const total = bank + player.chips;
+    if (process.env.DATABASE_URL) {
+        (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [total, playerId]).catch(() => { });
+        if (player.chips > 0)
+            (0, db_1.logTransaction)(playerId, 'table_leave', player.chips, `AFK kick from ${tableId}`);
+    }
+    playerBanks.delete(`${tableId}:${playerId}`);
+    for (const [ws2, c2] of clients) {
+        if (c2.tableId === tableId && c2.playerId === playerId && ws2.readyState === ws_1.WebSocket.OPEN)
+            send(ws2, { type: 'afk_kicked' });
+    }
+    (0, game_1.removePlayer)(state, playerId);
+    tables.set(tableId, state);
+    broadcastTable(tableId);
+    const inHand = state.street !== 'waiting' && state.street !== 'showdown';
+    if (inHand)
+        setTimeout(() => resolveHandAfterDisconnect(tableId), 600);
+}
+function scheduleAfkKick(tableId, playerId) {
+    if (!isCashTable(tableId))
+        return;
+    if (sitOutSet.has(`${tableId}:${playerId}`))
+        return;
+    cancelAfkKick(tableId, playerId);
+    afkKickTimers.set(`${tableId}:${playerId}`, setTimeout(() => kickAfkPlayer(tableId, playerId), AFK_KICK_MS));
+}
+function cancelAfkKick(tableId, playerId) {
+    const t = afkKickTimers.get(`${tableId}:${playerId}`);
+    if (t) {
+        clearTimeout(t);
+        afkKickTimers.delete(`${tableId}:${playerId}`);
+    }
+}
+function scheduleNextHand(tableId, delay = 4500) {
     setTimeout(() => {
         if (sfEndedTables.has(tableId))
             return;
@@ -147,7 +199,6 @@ function scheduleNextHand(tableId, delay = 4000) {
         if (!s)
             return;
         if (canStartTable(tableId, s)) {
-            clearTableGifts(tableId);
             applySFBlindsIfDue(tableId, s);
             if ((0, spinFlip_1.getSFRoomId)(tableId))
                 startSFHand(s);
@@ -216,6 +267,7 @@ function setActionTimer(tableId) {
             if (c2.tableId === tableId && c2.playerId === pp.id && ws2.readyState === ws_1.WebSocket.OPEN)
                 send(ws2, { type: 'you_are_afk' });
         }
+        scheduleAfkKick(tableId, pp.id);
         autoFoldPlayer(tableId, pp.id, true);
     }, ACTION_TIMEOUT_MS));
 }
@@ -238,7 +290,7 @@ function autoFoldPlayer(tableId, playerId, isTimed) {
     st = tables.get(tableId);
     if (st.street === 'showdown') {
         saveHandStats(st).catch(console.error);
-        scheduleNextHand(tableId, isTimed ? 4000 : 2000);
+        scheduleNextHand(tableId, isTimed ? 4500 : 4500);
     }
     else {
         setActionTimer(tableId);
@@ -261,7 +313,7 @@ function foldDisconnectedPlayers(tableId) {
     s = tables.get(tableId);
     if (s.street === 'showdown') {
         saveHandStats(s).catch(console.error);
-        scheduleNextHand(tableId, 2000);
+        scheduleNextHand(tableId, 4500);
     }
     else {
         setTimeout(() => foldDisconnectedPlayers(tableId), 150);
@@ -300,7 +352,7 @@ function resolveHandAfterDisconnect(tableId) {
         tables.set(tableId, s);
         broadcastTable(tableId);
         saveHandStats(s).catch(console.error);
-        scheduleNextHand(tableId, 2000);
+        scheduleNextHand(tableId, 4500);
     }
     else if (notFolded.length > 1) {
         tables.set(tableId, s);
@@ -414,7 +466,7 @@ function scheduleStart(tableId) {
         tables.set(tableId, state);
         broadcastTable(tableId);
         setActionTimer(tableId);
-    }, 3000);
+    }, 4500);
     startTimers.set(tableId, timer);
 }
 // ─── Broadcast ────────────────────────────────────────────────────────────────
@@ -428,7 +480,9 @@ function broadcastTable(tableId) {
             continue;
         if (ws.readyState !== ws_1.WebSocket.OPEN)
             continue;
-        const msg = { type: 'state', state: (0, game_1.maskForPlayer)(state, client.playerId) };
+        const masked = (0, game_1.maskForPlayer)(state, client.playerId);
+        masked.players = masked.players.map((p) => ({ ...p, afk: afkMode.has(`${tableId}:${p.id}`) }));
+        const msg = { type: 'state', state: masked };
         if (sfPrize !== undefined)
             msg.sfPrize = sfPrize;
         send(ws, msg);
@@ -474,11 +528,18 @@ function handleMessage(ws, msg) {
     const { playerId, tableId } = client;
     if (type === 'here') {
         afkMode.delete(`${tableId}:${playerId}`);
+        cancelAfkKick(tableId, playerId);
         send(ws, { type: 'here_ok' });
+        // Resume hand if table was paused waiting for this player
+        const stateHere = tables.get(tableId);
+        if (stateHere && stateHere.street === 'waiting' && canStartTable(tableId, stateHere)) {
+            scheduleStart(tableId);
+        }
         return;
     }
     if (type === 'action') {
         afkMode.delete(`${tableId}:${playerId}`);
+        cancelAfkKick(tableId, playerId);
         const { action, amount } = msg;
         const state = tables.get(tableId);
         if (!state)
@@ -570,6 +631,7 @@ function handleMessage(ws, msg) {
     if (type === 'sit_out') {
         sitOutSet.add(`${tableId}:${playerId}`);
         afkMode.add(`${tableId}:${playerId}`);
+        cancelAfkKick(tableId, playerId); // voluntary sit-out — no kick
         return;
     }
     if (type === 'sit_in') {
@@ -610,6 +672,7 @@ function handleMessage(ws, msg) {
         playerBanks.set(bankKey, newBank);
         if (process.env.DATABASE_URL) {
             (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => { });
+            (0, db_1.logTransaction)(playerId, 'bomb', -price, `💣 Bomb «${bombId}» → ${targetId} at ${tableId}`);
         }
         send(ws, { type: 'bank_update', bank: newBank });
         broadcastToTable(tableId, {
@@ -633,6 +696,7 @@ function handleMessage(ws, msg) {
         playerBanks.set(bankKey, newBank);
         if (process.env.DATABASE_URL) {
             (0, db_1.getPool)().query('UPDATE pf_users SET chips=$1 WHERE tg_id=$2', [newBank, playerId]).catch(() => { });
+            (0, db_1.logTransaction)(playerId, 'gift', -price, `🎁 Gift «${giftId}» → ${targetId} at ${tableId}`);
         }
         send(ws, { type: 'bank_update', bank: newBank });
         if (!tableGifts.has(tableId))
@@ -671,6 +735,7 @@ function handleDisconnect(ws) {
     }
     afkMode.delete(`${tableId}:${playerId}`);
     sitOutSet.delete(`${tableId}:${playerId}`);
+    cancelAfkKick(tableId, playerId);
     const afkReqTimer = afkRequestTimers.get(`${tableId}:${playerId}`);
     if (afkReqTimer) {
         clearTimeout(afkReqTimer);
@@ -915,6 +980,12 @@ async function checkSFEnd(state) {
             if (key.startsWith(`${tableId}:`)) {
                 clearTimeout(afkRequestTimers.get(key));
                 afkRequestTimers.delete(key);
+            }
+        }
+        for (const key of [...afkKickTimers.keys()]) {
+            if (key.startsWith(`${tableId}:`)) {
+                clearTimeout(afkKickTimers.get(key));
+                afkKickTimers.delete(key);
             }
         }
         tableGifts.delete(tableId);
