@@ -481,7 +481,7 @@ function scheduleStart(tableId: string) {
     tables.set(tableId, state)
     broadcastTable(tableId)
     setActionTimer(tableId)
-  }, 4500)
+  }, getSFRoomId(tableId) ? 13500 : 4500)
   startTimers.set(tableId, timer)
 }
 
