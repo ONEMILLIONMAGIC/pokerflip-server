@@ -778,11 +778,20 @@ app.post('/api/claim-mission', async (req, res) => {
     if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
 
     const REWARDS: Record<string, { chips: number; label: string }> = {
-      play_5:     { chips: 500,  label: 'Play 5 Hands' },
-      play_10:    { chips: 1000, label: 'Play 10 Hands' },
-      win_hand:   { chips: 300,  label: 'Win a Hand' },
-      win_3:      { chips: 800,  label: 'Win 3 Hands' },
-      send_bomb:  { chips: 200,  label: 'Throw a Bomb' },
+      play_5:     { chips: 100, label: 'Play 5 Hands' },
+      play_10:    { chips: 200, label: 'Play 10 Hands' },
+      win_hand:   { chips: 150, label: 'Win a Hand' },
+      win_3:      { chips: 225, label: 'Win 3 Hands' },
+      send_bomb:  { chips: 100, label: 'Throw a Bomb' },
+      two_pair:   { chips: 100, label: 'Two Pair' },
+      trips:      { chips: 150, label: 'Three of a Kind' },
+      straight:   { chips: 250, label: 'Straight' },
+      flush:      { chips: 300, label: 'Flush' },
+      full_house: { chips: 350, label: 'Full House' },
+      quads:      { chips: 500, label: 'Four of a Kind' },
+      won_bluff:  { chips: 125, label: 'Win by Bluff' },
+      win_allin:  { chips: 200, label: 'Win an All-In' },
+      big_pot:    { chips: 175, label: 'Win a Big Pot' },
     }
     const reward = REWARDS[missionId]
     if (!reward) return res.status(400).json({ error: 'unknown mission' })
