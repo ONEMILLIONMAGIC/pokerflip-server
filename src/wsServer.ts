@@ -469,7 +469,9 @@ function broadcastTable(tableId: string) {
   for (const [ws, client] of clients) {
     if (client.tableId !== tableId) continue
     if (ws.readyState !== WebSocket.OPEN) continue
-    const msg: any = { type: 'state', state: maskForPlayer(state, client.playerId) }
+    const masked = maskForPlayer(state, client.playerId)
+    masked.players = masked.players.map((p: any) => ({ ...p, afk: afkMode.has(`${tableId}:${p.id}`) }))
+    const msg: any = { type: 'state', state: masked }
     if (sfPrize !== undefined) msg.sfPrize = sfPrize
     send(ws, msg)
   }
