@@ -2,6 +2,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { GameState, createTable, addPlayer, removePlayer, startHand, applyAction, advanceStreet, canStart, maskForPlayer, PlayerAction } from './engine/game'
 import { getPool, logTransaction } from './db'
 import { getSFRoomId, getSFTableConfig, completeSFSession } from './spinFlip'
+import { evaluate } from './engine/handEval'
 
 interface Client {
   ws: WebSocket
@@ -1028,13 +1029,21 @@ async function saveHandStats(state: GameState) {
     }
   }
 
+  const boardForEval = state.board.filter(c => (c.rank as string) !== '?')
   db.query(
     `INSERT INTO pf_hand_history (table_id, board, players, winners, pot) VALUES ($1,$2,$3,$4,$5)`,
-    [state.tableId, JSON.stringify(state.board), JSON.stringify(state.players.filter(p => p.holeCards?.length).map(p => ({
-      id: p.id, name: p.name, holeCards: p.holeCards, folded: p.folded,
-      won: winnerIds.has(p.id), wonAmount: state.winners.find(w => w.playerId === p.id)?.amount || 0,
-      hand: state.winners.find(w => w.playerId === p.id)?.hand || '',
-    }))), JSON.stringify(state.winners), state.winners.reduce((s, w) => s + w.amount, 0)]
+    [state.tableId, JSON.stringify(state.board), JSON.stringify(state.players.filter(p => p.holeCards?.length).map(p => {
+      const winnerEntry = state.winners.find(w => w.playerId === p.id)
+      let handName = winnerEntry?.hand || ''
+      if (!handName && !p.folded && boardForEval.length >= 3) {
+        const realHole = p.holeCards.filter(c => (c.rank as string) !== '?')
+        if (realHole.length === 2) {
+          try { handName = evaluate([...realHole, ...boardForEval] as any).name } catch {}
+        }
+      }
+      return { id: p.id, name: p.name, holeCards: p.holeCards, folded: p.folded,
+        won: winnerIds.has(p.id), wonAmount: winnerEntry?.amount || 0, hand: handName }
+    })), JSON.stringify(state.winners), state.winners.reduce((s, w) => s + w.amount, 0)]
   ).catch(() => {})
 
   // Chip dump detection: soft, non-blocking

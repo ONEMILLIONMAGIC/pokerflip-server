@@ -13,6 +13,7 @@ const actionTimers = new Map();
 const afkTimers = new Map();
 const playerBanks = new Map();
 const runoutTables = new Set();
+const lastTurnNotif = new Map(); // playerId → timestamp
 const sfBlinds = new Map();
 const sfBlindPendingNotified = new Set();
 const sfEndedTables = new Set();
@@ -224,6 +225,29 @@ function clearActionTimer(tableId) {
         actionTimers.delete(tableId);
     }
 }
+async function sendTurnNotification(playerId, tableId) {
+    const botToken = process.env.BOT_TOKEN;
+    if (!botToken)
+        return;
+    // Rate limit: once per 30s per player
+    const now = Date.now();
+    if ((lastTurnNotif.get(playerId) ?? 0) > now - 30000)
+        return;
+    lastTurnNotif.set(playerId, now);
+    // Only send if player has no open WS connection (TMA is closed/backgrounded)
+    const hasWs = [...clients.values()].some(c => c.playerId === playerId && c.tableId === tableId);
+    if (hasWs)
+        return;
+    const tableName = tableId.replace(/_/g, ' ');
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            chat_id: playerId,
+            text: `🃏 *Ваш ход!*\nСтол: ${tableName}\n[Открыть игру](https://t.me/pokerflip_bot/play)`,
+            parse_mode: 'Markdown',
+        })
+    }).catch(() => { });
+}
 function setActionTimer(tableId) {
     clearActionTimer(tableId);
     if (runoutTables.has(tableId))
@@ -248,6 +272,8 @@ function setActionTimer(tableId) {
         actionTimers.set(tableId, setTimeout(() => autoFoldPlayer(tableId, p.id, false), 800));
         return;
     }
+    // Push notification if player's TMA is not focused (no active WS from them in last 8s)
+    sendTurnNotification(p.id, tableId).catch(() => { });
     // Normal timer
     actionTimers.set(tableId, setTimeout(() => {
         const st = tables.get(tableId);
@@ -466,7 +492,7 @@ function scheduleStart(tableId) {
         tables.set(tableId, state);
         broadcastTable(tableId);
         setActionTimer(tableId);
-    }, 4500);
+    }, (0, spinFlip_1.getSFRoomId)(tableId) ? 13500 : 4500);
     startTimers.set(tableId, timer);
 }
 // ─── Broadcast ────────────────────────────────────────────────────────────────
@@ -952,7 +978,8 @@ async function checkSFEnd(state) {
     });
     if (!result)
         return;
-    broadcastToTable(tableId, { type: 'tournament_end', winnerId: winner.id, winnerName: winner.name, prize: result.prize, tableId });
+    const winnerHand = state.winners.find(w => w.playerId === winner.id)?.hand || '';
+    broadcastToTable(tableId, { type: 'tournament_end', winnerId: winner.id, winnerName: winner.name, prize: result.prize, tableId, winnerHand });
     setTimeout(() => {
         tables.delete(tableId);
         sfBlinds.delete(tableId);
@@ -1030,10 +1057,52 @@ async function saveHandStats(state) {
             won: winnerIds.has(p.id), wonAmount: state.winners.find(w => w.playerId === p.id)?.amount || 0,
             hand: state.winners.find(w => w.playerId === p.id)?.hand || '',
         }))), JSON.stringify(state.winners), state.winners.reduce((s, w) => s + w.amount, 0)]).catch(() => { });
+    // Chip dump detection: soft, non-blocking
+    if (!isSF && !TOURNAMENT_TABLE_IDS.has(state.tableId)) {
+        checkChipDump(state).catch(() => { });
+    }
     if (TOURNAMENT_TABLE_IDS.has(state.tableId))
         await checkTournamentEnd(state).catch(console.error);
     if (isSF)
         await checkSFEnd(state).catch(console.error);
+}
+async function checkChipDump(state) {
+    if (!process.env.DATABASE_URL)
+        return;
+    const db = (0, db_1.getPool)();
+    const winnerIds = new Set(state.winners.map(w => w.playerId));
+    const losers = state.players.filter(p => !winnerIds.has(p.id) && !p.folded && p.holeCards?.some(c => c.rank !== '?'));
+    if (!losers.length || state.winners.length !== 1)
+        return;
+    const winnerId = state.winners[0].playerId;
+    for (const loser of losers) {
+        if (loser.id === winnerId)
+            continue;
+        // Get last 12 hands at this table involving both players
+        const { rows } = await db.query(`SELECT players FROM pf_hand_history
+       WHERE table_id=$1 AND players::text LIKE $2 AND players::text LIKE $3
+       ORDER BY created_at DESC LIMIT 12`, [state.tableId, `%"id":"${loser.id}"%`, `%"id":"${winnerId}"%`]).catch(() => ({ rows: [] }));
+        if (rows.length < 8)
+            continue;
+        let loserLostCount = 0;
+        let totalLost = 0;
+        for (const row of rows) {
+            const players = row.players;
+            const loserEntry = players.find((p) => p.id === loser.id);
+            const winnerEntry = players.find((p) => p.id === winnerId);
+            if (!loserEntry || !winnerEntry)
+                continue;
+            if (!loserEntry.won && winnerEntry.won) {
+                loserLostCount++;
+                totalLost += winnerEntry.wonAmount || 0;
+            }
+        }
+        const lossRate = loserLostCount / rows.length;
+        // Flag if lost to same player in 75%+ of hands AND transferred significant chips
+        if (lossRate >= 0.75 && totalLost >= 5000) {
+            await db.query(`UPDATE pf_users SET suspicious=TRUE, suspicious_reason=$1 WHERE tg_id=$2 AND suspicious=FALSE`, [`Lost ${Math.round(lossRate * 100)}% of ${rows.length} hands to same player (${totalLost} chips) at ${state.tableId}`, loser.id]).catch(() => { });
+        }
+    }
 }
 async function checkTournamentEnd(state) {
     const db = (0, db_1.getPool)();

@@ -610,7 +610,7 @@ app.post('/api/auth', async (req, res) => {
         const user = rows[0];
         // Update login streak (no chip bonus, just counter for achievements)
         const today = new Date().toISOString().slice(0, 10);
-        const lastLogin = user.last_login_date ? String(user.last_login_date).slice(0, 10) : null;
+        const lastLogin = user.last_login_date ? new Date(user.last_login_date).toISOString().slice(0, 10) : null;
         if (lastLogin !== today) {
             const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
             const newStreak = lastLogin === yesterday ? (user.streak_days || 0) + 1 : 1;
@@ -681,6 +681,57 @@ app.post('/api/spin', async (req, res) => {
         const { rows: updated } = await db.query(`UPDATE pf_users SET chips = chips + $1, last_spin_at = NOW() WHERE tg_id=$2 RETURNING *`, [prize, String(tgUser.id)]);
         await (0, db_1.logTransaction)(String(tgUser.id), 'spin', prize, `Daily case: ${rarity} chest · +${prize.toLocaleString()} chips`);
         res.json({ prize, chips: updated[0].chips, rarity });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'server error' });
+    }
+});
+// POST /api/claim-mission — credit chips for completing a daily mission
+app.post('/api/claim-mission', async (req, res) => {
+    try {
+        const { initData, missionId } = req.body;
+        if (!initData || !missionId)
+            return res.status(400).json({ error: 'missing params' });
+        const params = (0, utils_1.validateTgInitData)(initData);
+        if (!params)
+            return res.status(403).json({ error: 'invalid initData' });
+        const tgUser = (0, utils_1.parseTgUser)(params);
+        if (!tgUser?.id)
+            return res.status(400).json({ error: 'no user' });
+        const REWARDS = {
+            play_5: { chips: 100, label: 'Play 5 Hands' },
+            play_10: { chips: 200, label: 'Play 10 Hands' },
+            win_hand: { chips: 150, label: 'Win a Hand' },
+            win_3: { chips: 225, label: 'Win 3 Hands' },
+            send_bomb: { chips: 100, label: 'Throw a Bomb' },
+            two_pair: { chips: 100, label: 'Two Pair' },
+            trips: { chips: 150, label: 'Three of a Kind' },
+            straight: { chips: 250, label: 'Straight' },
+            flush: { chips: 300, label: 'Flush' },
+            full_house: { chips: 350, label: 'Full House' },
+            quads: { chips: 500, label: 'Four of a Kind' },
+            won_bluff: { chips: 125, label: 'Win by Bluff' },
+            win_allin: { chips: 200, label: 'Win an All-In' },
+            big_pot: { chips: 175, label: 'Win a Big Pot' },
+            spin_daily: { chips: 75, label: 'Daily Spin' },
+            sf_played: { chips: 100, label: 'Play Spin & Flip' },
+            sf_won: { chips: 300, label: 'Win Spin & Flip' },
+            tourn_reg: { chips: 100, label: 'Join Tournament' },
+            tourn_won: { chips: 500, label: 'Win Tournament' },
+        };
+        const reward = REWARDS[missionId];
+        if (!reward)
+            return res.status(400).json({ error: 'unknown mission' });
+        const db = (0, db_1.getPool)();
+        const tgId = String(tgUser.id);
+        // Idempotent insert — fails silently if already claimed today
+        const { rowCount } = await db.query(`INSERT INTO pf_mission_claims (tg_id, mission_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [tgId, missionId]);
+        if (rowCount === 0)
+            return res.status(409).json({ error: 'already_claimed' });
+        const { rows } = await db.query(`UPDATE pf_users SET chips = chips + $1 WHERE tg_id = $2 RETURNING chips`, [reward.chips, tgId]);
+        await (0, db_1.logTransaction)(tgId, 'mission', reward.chips, `Daily mission: ${reward.label}`);
+        res.json({ chips: rows[0]?.chips ?? 0 });
     }
     catch (e) {
         console.error(e);
@@ -1030,6 +1081,67 @@ app.get('/api/balance', async (req, res) => {
     }
     catch (e) {
         res.status(500).json({ error: e?.message || 'server error' });
+    }
+});
+// GET /api/player-ranks?ids=id1,id2,... — return rank data for multiple players (for table badges)
+app.get('/api/player-ranks', async (req, res) => {
+    try {
+        const raw = req.query.ids || '';
+        const ids = raw.split(',').map(s => s.trim()).filter(Boolean).slice(0, 10);
+        if (!ids.length)
+            return res.json([]);
+        const db = (0, db_1.getPool)();
+        const { rows } = await db.query(`SELECT tg_id, hands_played, hands_won, biggest_pot, tournaments_won, streak_days, suspicious
+       FROM pf_users WHERE tg_id = ANY($1)`, [ids]);
+        res.json(rows);
+    }
+    catch {
+        res.json([]);
+    }
+});
+// GET /api/my-hands?tgId=xxx — last 20 hands the player participated in
+app.get('/api/my-hands', async (req, res) => {
+    try {
+        const tgId = (req.query.tgId || '').trim();
+        if (!tgId)
+            return res.json([]);
+        const db = (0, db_1.getPool)();
+        const { rows } = await db.query(`SELECT id, table_id, board, players, winners, pot, created_at
+       FROM pf_hand_history
+       WHERE players @> $1::jsonb
+       ORDER BY created_at DESC LIMIT 20`, [JSON.stringify([{ id: tgId }])]);
+        // Return only relevant player slice to keep payload small
+        const result = rows.map((r) => {
+            const players = r.players;
+            const me = players.find((p) => p.id === tgId);
+            return {
+                id: r.id, tableId: r.table_id, pot: r.pot, createdAt: r.created_at,
+                board: r.board,
+                won: me?.won ?? false, wonAmount: me?.wonAmount ?? 0,
+                hand: me?.hand ?? '', folded: me?.folded ?? false,
+                holeCards: me?.holeCards ?? [],
+                winners: r.winners,
+            };
+        });
+        res.json(result);
+    }
+    catch {
+        res.json([]);
+    }
+});
+// GET /api/admin/suspicious — list flagged players (admin only)
+app.get('/api/admin/suspicious', async (req, res) => {
+    const secret = req.headers['x-admin-secret'];
+    if (!secret || secret !== process.env.ADMIN_SECRET)
+        return res.status(403).json({ error: 'forbidden' });
+    try {
+        const db = (0, db_1.getPool)();
+        const { rows } = await db.query(`SELECT tg_id, first_name, username, chips, suspicious_reason, hands_played, hands_won, created_at
+       FROM pf_users WHERE suspicious=TRUE ORDER BY created_at DESC`);
+        res.json(rows);
+    }
+    catch {
+        res.status(500).json({ error: 'db error' });
     }
 });
 // POST /api/admin/credit — manual chip credit (protected by ADMIN_SECRET)

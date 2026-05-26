@@ -1,0 +1,14 @@
+{
+  "id": "session-1779613467942",
+  "startedAt": "2026-05-24T09:04:27.942Z",
+  "cwd": "/Users/utente/pokerflip/server",
+  "context": {},
+  "metrics": {
+    "edits": 44,
+    "commands": 0,
+    "tasks": 0,
+    "errors": 0
+  },
+  "endedAt": "2026-05-26T05:53:25.648Z",
+  "duration": 161337706
+}
