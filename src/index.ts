@@ -766,6 +766,50 @@ app.post('/api/spin', async (req, res) => {
   }
 })
 
+// POST /api/claim-mission — credit chips for completing a daily mission
+app.post('/api/claim-mission', async (req, res) => {
+  try {
+    const { initData, missionId } = req.body as { initData?: string; missionId?: string }
+    if (!initData || !missionId) return res.status(400).json({ error: 'missing params' })
+
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'invalid initData' })
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
+
+    const REWARDS: Record<string, { chips: number; label: string }> = {
+      play_5:     { chips: 500,  label: 'Play 5 Hands' },
+      play_10:    { chips: 1000, label: 'Play 10 Hands' },
+      win_hand:   { chips: 300,  label: 'Win a Hand' },
+      win_3:      { chips: 800,  label: 'Win 3 Hands' },
+      send_bomb:  { chips: 200,  label: 'Throw a Bomb' },
+    }
+    const reward = REWARDS[missionId]
+    if (!reward) return res.status(400).json({ error: 'unknown mission' })
+
+    const db = getPool()
+    const tgId = String(tgUser.id)
+
+    // Idempotent insert — fails silently if already claimed today
+    const { rowCount } = await db.query(
+      `INSERT INTO pf_mission_claims (tg_id, mission_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [tgId, missionId]
+    )
+    if (rowCount === 0) return res.status(409).json({ error: 'already_claimed' })
+
+    const { rows } = await db.query(
+      `UPDATE pf_users SET chips = chips + $1 WHERE tg_id = $2 RETURNING chips`,
+      [reward.chips, tgId]
+    )
+    await logTransaction(tgId, 'mission', reward.chips, `Daily mission: ${reward.label}`)
+
+    res.json({ chips: rows[0]?.chips ?? 0 })
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'server error' })
+  }
+})
+
 // POST /api/payments/ton-verify — check blockchain for payment by ref comment
 app.post('/api/payments/ton-verify', async (req, res) => {
   try {

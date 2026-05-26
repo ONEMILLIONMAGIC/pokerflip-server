@@ -167,4 +167,13 @@ export async function initDB() {
       ('sf_royale', 500000)
     ON CONFLICT DO NOTHING
   `)
+  // Daily mission claims — prevents double-claiming server-side
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS pf_mission_claims (
+      tg_id      TEXT NOT NULL,
+      mission_id TEXT NOT NULL,
+      claim_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      PRIMARY KEY (tg_id, mission_id, claim_date)
+    )
+  `)
 }
