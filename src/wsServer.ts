@@ -1038,7 +1038,7 @@ async function checkChipDump(state: GameState) {
       [state.tableId, `%"id":"${loser.id}"%`, `%"id":"${winnerId}"%`]
     ).catch(() => ({ rows: [] as any[] }))
 
-    if (rows.length < 6) continue
+    if (rows.length < 8) continue
 
     let loserLostCount = 0
     let totalLost = 0
