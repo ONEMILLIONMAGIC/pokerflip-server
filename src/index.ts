@@ -1021,7 +1021,7 @@ app.get('/api/leaderboard', async (req, res) => {
       SELECT tg_id, first_name, username, photo_url, chips, hands_played, hands_won, biggest_pot,
         (hands_played * 10 + hands_won * 30 + biggest_pot / 500) AS xp
       FROM pf_users
-      ${weekly ? "WHERE created_at >= NOW() - INTERVAL '7 days'" : ''}
+      ${weekly ? "WHERE last_login_date >= CURRENT_DATE - INTERVAL '7 days'" : ''}
       ORDER BY (hands_played * 10 + hands_won * 30 + biggest_pot / 500) DESC, chips DESC
       LIMIT 50
     `)
