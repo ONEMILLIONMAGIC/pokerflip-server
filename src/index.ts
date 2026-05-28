@@ -1415,6 +1415,35 @@ app.get('/api/spinflip/admin/stats', async (req, res) => {
   try { res.json(await getSFAdminStats()) } catch (e: any) { res.status(500).json({ error: e.message }) }
 })
 
+// POST /api/pack-open — credit chips reward from pack opening
+app.post('/api/pack-open', async (req, res) => {
+  try {
+    const { initData, chips } = req.body as { initData?: string; chips?: number }
+    if (!initData) return res.status(400).json({ error: 'no initData' })
+    if (!chips || chips <= 0 || !Number.isInteger(chips)) return res.status(400).json({ error: 'invalid chips' })
+    if (chips > 1_100_000) return res.status(400).json({ error: 'chips out of range' })
+
+    const params = validateTgInitData(initData)
+    if (!params) return res.status(403).json({ error: 'invalid initData' })
+
+    const tgUser = parseTgUser(params)
+    if (!tgUser?.id) return res.status(400).json({ error: 'no user' })
+
+    const db = getPool()
+    const { rows } = await db.query(
+      'UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING chips',
+      [chips, String(tgUser.id)]
+    )
+    if (!rows[0]) return res.status(404).json({ error: 'user not found' })
+
+    await logTransaction(String(tgUser.id), 'achievement', chips, `Pack reward: +${chips.toLocaleString()} chips`)
+    res.json({ chips: rows[0].chips })
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'server error' })
+  }
+})
+
 const server = createServer(app)
 const wss = new WebSocketServer({ server })
 
