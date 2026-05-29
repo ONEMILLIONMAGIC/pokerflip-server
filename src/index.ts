@@ -839,11 +839,53 @@ app.post('/api/claim-mission', async (req, res) => {
       tourn_reg:  { chips: 100, label: 'Join Tournament' },
       tourn_won:  { chips: 500, label: 'Win Tournament' },
     }
-    const reward = REWARDS[missionId]
-    if (!reward) return res.status(400).json({ error: 'unknown mission' })
 
     const db = getPool()
     const tgId = String(tgUser.id)
+
+    // ── X2 daily bonus — granted when all 4 today's missions are claimed ──
+    if (missionId === 'daily_x2_bonus') {
+      const DAY_SETS: string[][] = [
+        ['play_5','win_hand','send_bomb','straight'],
+        ['play_5','two_pair','won_bluff','flush'],
+        ['play_10','win_3','trips','send_bomb'],
+        ['play_5','win_hand','win_allin','flush'],
+        ['play_5','won_bluff','trips','full_house'],
+        ['play_10','two_pair','win_3','straight'],
+        ['play_5','win_hand','big_pot','full_house'],
+        ['spin_daily','sf_played','play_5','straight'],
+        ['tourn_reg','play_5','flush','won_bluff'],
+        ['sf_played','tourn_reg','win_3','trips'],
+      ]
+      const d = new Date()
+      const dayOfYear = Math.floor((d.getTime() - new Date(d.getFullYear(), 0, 0).getTime()) / 86400000)
+      const todayIds = DAY_SETS[dayOfYear % DAY_SETS.length]
+      const bonusAmount = todayIds.reduce((s, id) => s + (REWARDS[id]?.chips ?? 0), 0)
+
+      const { rows: claimedRows } = await db.query(
+        `SELECT mission_id FROM pf_mission_claims WHERE tg_id = $1 AND claimed_at >= CURRENT_DATE`,
+        [tgId]
+      )
+      const claimedIds = (claimedRows as any[]).map(r => r.mission_id)
+      const allClaimed = todayIds.every(id => claimedIds.includes(id))
+      if (!allClaimed) return res.status(400).json({ error: 'not_all_missions_claimed' })
+
+      const { rowCount: rc } = await db.query(
+        `INSERT INTO pf_mission_claims (tg_id, mission_id) VALUES ($1, 'daily_x2_bonus') ON CONFLICT DO NOTHING`,
+        [tgId]
+      )
+      if (rc === 0) return res.status(409).json({ error: 'already_claimed' })
+
+      const { rows } = await db.query(
+        `UPDATE pf_users SET chips = chips + $1 WHERE tg_id = $2 RETURNING chips`,
+        [bonusAmount, tgId]
+      )
+      await logTransaction(tgId, 'mission', bonusAmount, `Daily ×2 bonus: +${bonusAmount} chips`)
+      return res.json({ chips: rows[0]?.chips ?? 0, bonus: bonusAmount })
+    }
+
+    const reward = REWARDS[missionId]
+    if (!reward) return res.status(400).json({ error: 'unknown mission' })
 
     // Idempotent insert — fails silently if already claimed today
     const { rowCount } = await db.query(

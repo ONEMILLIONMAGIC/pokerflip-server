@@ -125,8 +125,8 @@ function canStartTable(tableId, state) {
     if ((0, spinFlip_1.getSFRoomId)(tableId))
         return state.players.filter(p => p.chips > 0).length >= 2;
     if (isCashTable(tableId)) {
-        // Cash: need 2+ connected players who are not in AFK mode
-        return state.players.filter(p => p.connected && !afkMode.has(`${tableId}:${p.id}`)).length >= 2;
+        // Cash: need 2+ connected players with chips who are not in AFK mode
+        return state.players.filter(p => p.connected && p.chips > 0 && !afkMode.has(`${tableId}:${p.id}`)).length >= 2;
     }
     return (0, game_1.canStart)(state);
 }
