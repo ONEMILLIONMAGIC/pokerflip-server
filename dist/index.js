@@ -273,6 +273,17 @@ app.post('/api/webhook', async (req, res) => {
         console.error('Webhook error:', e);
     }
 });
+// POST /api/feedback — forward user message to admin via bot
+app.post('/api/feedback', async (req, res) => {
+    res.sendStatus(200);
+    const { tgId, name, message, type } = req.body;
+    if (!message?.trim())
+        return;
+    const typeLabel = type === 'bug' ? '🐛 Баг' : type === 'question' ? '❓ Вопрос' : '💡 Идея';
+    const from = name ? `*${name}*` : 'Аноним';
+    const text = `${typeLabel} от ${from} (id: \`${tgId || 'unknown'}\`)\n\n${message.trim()}`;
+    await tgSend(501197162, text);
+});
 // GET /api/notify — send push notifications to users who haven't been active
 app.get('/api/notify', async (req, res) => {
     const secret = req.headers['x-notify-secret'];
@@ -324,8 +335,29 @@ app.get('/api/notify', async (req, res) => {
         res.status(500).json({ error: 'server error' });
     }
 });
-app.get('/tables', (_req, res) => {
+// Track lobby-active users by tgId (last seen within 90s)
+const lobbyActive = new Map(); // tgId → timestamp
+app.get('/tables', (req, res) => {
+    // Mark caller as lobby-active if they send tgId query param
+    const tgId = req.query.tgId;
+    if (tgId)
+        lobbyActive.set(tgId, Date.now());
+    // Purge stale entries
+    const cutoff = Date.now() - 90000;
+    for (const [id, ts] of lobbyActive)
+        if (ts < cutoff)
+            lobbyActive.delete(id);
     res.json((0, wsServer_1.getTableStats)());
+});
+app.get('/api/online', (_req, res) => {
+    const stats = (0, wsServer_1.getTableStats)();
+    const atTables = Object.values(stats).reduce((s, t) => s + t.players, 0);
+    const cutoff = Date.now() - 90000;
+    for (const [id, ts] of lobbyActive)
+        if (ts < cutoff)
+            lobbyActive.delete(id);
+    const inLobby = lobbyActive.size;
+    res.json({ atTables, inLobby, total: atTables + inLobby });
 });
 const MIN_PLAYERS = 6;
 const TOURNAMENT_CONFIGS = {
@@ -899,7 +931,7 @@ app.get('/api/leaderboard', async (req, res) => {
       SELECT tg_id, first_name, username, photo_url, chips, hands_played, hands_won, biggest_pot,
         (hands_played * 10 + hands_won * 30 + biggest_pot / 500) AS xp
       FROM pf_users
-      ${weekly ? "WHERE created_at >= NOW() - INTERVAL '7 days'" : ''}
+      ${weekly ? "WHERE last_login_date >= CURRENT_DATE - INTERVAL '7 days'" : ''}
       ORDER BY (hands_played * 10 + hands_won * 30 + biggest_pot / 500) DESC, chips DESC
       LIMIT 50
     `);
@@ -1294,6 +1326,34 @@ app.get('/api/spinflip/admin/stats', async (req, res) => {
     }
     catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+// POST /api/pack-open — credit chips reward from pack opening
+app.post('/api/pack-open', async (req, res) => {
+    try {
+        const { initData, chips } = req.body;
+        if (!initData)
+            return res.status(400).json({ error: 'no initData' });
+        if (!chips || chips <= 0 || !Number.isInteger(chips))
+            return res.status(400).json({ error: 'invalid chips' });
+        if (chips > 1100000)
+            return res.status(400).json({ error: 'chips out of range' });
+        const params = (0, utils_1.validateTgInitData)(initData);
+        if (!params)
+            return res.status(403).json({ error: 'invalid initData' });
+        const tgUser = (0, utils_1.parseTgUser)(params);
+        if (!tgUser?.id)
+            return res.status(400).json({ error: 'no user' });
+        const db = (0, db_1.getPool)();
+        const { rows } = await db.query('UPDATE pf_users SET chips = chips + $1 WHERE tg_id=$2 RETURNING chips', [chips, String(tgUser.id)]);
+        if (!rows[0])
+            return res.status(404).json({ error: 'user not found' });
+        await (0, db_1.logTransaction)(String(tgUser.id), 'achievement', chips, `Pack reward: +${chips.toLocaleString()} chips`);
+        res.json({ chips: rows[0].chips });
+    }
+    catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'server error' });
     }
 });
 const server = (0, http_1.createServer)(app);

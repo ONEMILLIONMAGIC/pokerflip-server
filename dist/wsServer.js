@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.setupWS = setupWS;
+exports.getOnlineCount = getOnlineCount;
 exports.getTableStats = getTableStats;
 const ws_1 = require("ws");
 const game_1 = require("./engine/game");
@@ -24,6 +25,8 @@ const afkMode = new Set();
 const sitOutSet = new Set(); // tableId:playerId
 const afkRequestTimers = new Map(); // tableId:playerId → auto-clear timer
 const afkKickTimers = new Map(); // tableId:playerId → 3-min cash-table kick
+const afkWarnings = new Map(); // tableId:playerId → consecutive timed-out turns
+const AFK_WARNINGS_BEFORE_AFK = 2; // miss this many turns in a row → go AFK
 const tableGifts = new Map(); // tableId → targetId → gift
 const BOMB_PRICES = {
     tomato: 50, banana: 100, egg: 100, poop: 200, fish: 250,
@@ -290,13 +293,27 @@ function setActionTimer(tableId) {
             setActionTimer(tableId);
             return;
         }
-        afkMode.add(`${tableId}:${pp.id}`);
-        for (const [ws2, c2] of clients) {
-            if (c2.tableId === tableId && c2.playerId === pp.id && ws2.readyState === ws_1.WebSocket.OPEN)
-                send(ws2, { type: 'you_are_afk' });
+        const warnKey = `${tableId}:${pp.id}`;
+        const isSF = !!(0, spinFlip_1.getSFRoomId)(tableId);
+        const warnings = (afkWarnings.get(warnKey) ?? 0) + 1;
+        afkWarnings.set(warnKey, warnings);
+        if (!isSF && warnings < AFK_WARNINGS_BEFORE_AFK) {
+            // Grace: auto-fold but don't mark AFK yet — just warn
+            for (const [ws2, c2] of clients) {
+                if (c2.tableId === tableId && c2.playerId === pp.id && ws2.readyState === ws_1.WebSocket.OPEN)
+                    send(ws2, { type: 'afk_warning', count: warnings, max: AFK_WARNINGS_BEFORE_AFK });
+            }
+            autoFoldPlayer(tableId, pp.id, true);
         }
-        scheduleAfkKick(tableId, pp.id);
-        autoFoldPlayer(tableId, pp.id, true);
+        else {
+            afkMode.add(warnKey);
+            for (const [ws2, c2] of clients) {
+                if (c2.tableId === tableId && c2.playerId === pp.id && ws2.readyState === ws_1.WebSocket.OPEN)
+                    send(ws2, { type: 'you_are_afk' });
+            }
+            scheduleAfkKick(tableId, pp.id);
+            autoFoldPlayer(tableId, pp.id, true);
+        }
     }, ACTION_TIMEOUT_MS));
 }
 function autoFoldPlayer(tableId, playerId, isTimed) {
@@ -563,6 +580,7 @@ function handleMessage(ws, msg) {
     const { playerId, tableId } = client;
     if (type === 'here') {
         afkMode.delete(`${tableId}:${playerId}`);
+        afkWarnings.delete(`${tableId}:${playerId}`);
         cancelAfkKick(tableId, playerId);
         send(ws, { type: 'here_ok' });
         // Resume hand if table was paused waiting for this player
@@ -574,6 +592,7 @@ function handleMessage(ws, msg) {
     }
     if (type === 'action') {
         afkMode.delete(`${tableId}:${playerId}`);
+        afkWarnings.delete(`${tableId}:${playerId}`);
         cancelAfkKick(tableId, playerId);
         const { action, amount } = msg;
         const state = tables.get(tableId);
@@ -769,6 +788,7 @@ function handleDisconnect(ws) {
         }
     }
     afkMode.delete(`${tableId}:${playerId}`);
+    afkWarnings.delete(`${tableId}:${playerId}`);
     sitOutSet.delete(`${tableId}:${playerId}`);
     cancelAfkKick(tableId, playerId);
     const afkReqTimer = afkRequestTimers.get(`${tableId}:${playerId}`);
@@ -1008,6 +1028,10 @@ async function checkSFEnd(state) {
             if (key.startsWith(`${tableId}:`))
                 afkMode.delete(key);
         }
+        for (const key of [...afkWarnings.keys()]) {
+            if (key.startsWith(`${tableId}:`))
+                afkWarnings.delete(key);
+        }
         for (const key of [...sitOutSet]) {
             if (key.startsWith(`${tableId}:`))
                 sitOutSet.delete(key);
@@ -1158,6 +1182,9 @@ async function checkTournamentEnd(state) {
     broadcastToTable(tableId, { type: 'tournament_end', winnerId: winner.id, winnerName: winner.name, prize: winnerPrize, tableId });
 }
 // ─── HTTP stats ───────────────────────────────────────────────────────────────
+function getOnlineCount() {
+    return clients.size;
+}
 function getTableStats() {
     const stats = {};
     for (const [tableId, state] of tables) {

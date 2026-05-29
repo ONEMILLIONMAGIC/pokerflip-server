@@ -180,8 +180,9 @@ function calculatePots(players) {
         const numContributors = contributors.filter(p => p.totalBet >= level).length;
         const potAmount = contribution * numContributors;
         const eligible = players.filter(p => !p.folded && p.totalBet >= level).map(p => p.id);
+        // refund = only one player ever put money at this level (uncalled excess)
         if (potAmount > 0)
-            pots.push({ amount: potAmount, eligible });
+            pots.push({ amount: potAmount, eligible, refund: numContributors === 1 });
         prev = level;
     }
     return pots;
@@ -201,11 +202,15 @@ function resolveShowdown(s) {
             continue;
         if (eligible.length === 1) {
             eligible[0].chips += pot.amount;
-            const e = winnerMap.get(eligible[0].id);
-            if (e)
-                e.amount += pot.amount;
-            else
-                winnerMap.set(eligible[0].id, { amount: pot.amount, hand: 'Last standing' });
+            if (!pot.refund) {
+                // Others contributed but folded — legitimate uncontested win
+                const e = winnerMap.get(eligible[0].id);
+                if (e)
+                    e.amount += pot.amount;
+                else
+                    winnerMap.set(eligible[0].id, { amount: pot.amount, hand: 'Last standing' });
+            }
+            // refund === true: player's own uncalled excess returned silently, not a win
             continue;
         }
         const results = eligible

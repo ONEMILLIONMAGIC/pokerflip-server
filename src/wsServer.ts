@@ -30,6 +30,9 @@ const afkMode = new Set<string>()
 const sitOutSet = new Set<string>() // tableId:playerId
 const afkRequestTimers = new Map<string, NodeJS.Timeout>() // tableId:playerId → auto-clear timer
 const afkKickTimers = new Map<string, NodeJS.Timeout>() // tableId:playerId → 3-min cash-table kick
+const afkWarnings = new Map<string, number>() // tableId:playerId → consecutive timed-out turns
+
+const AFK_WARNINGS_BEFORE_AFK = 2 // miss this many turns in a row → go AFK
 const tableGifts = new Map<string, Map<string, { giftId: string; tint: string; fromName: string }>>() // tableId → targetId → gift
 
 const BOMB_PRICES: Record<string, number> = {
@@ -131,8 +134,8 @@ function getTableConfig(tableId: string) {
 function canStartTable(tableId: string, state: GameState): boolean {
   if (getSFRoomId(tableId)) return state.players.filter(p => p.chips > 0).length >= 2
   if (isCashTable(tableId)) {
-    // Cash: need 2+ connected players who are not in AFK mode
-    return state.players.filter(p => p.connected && !afkMode.has(`${tableId}:${p.id}`)).length >= 2
+    // Cash: need 2+ connected players with chips who are not in AFK mode
+    return state.players.filter(p => p.connected && p.chips > 0 && !afkMode.has(`${tableId}:${p.id}`)).length >= 2
   }
   return canStart(state)
 }
@@ -286,13 +289,28 @@ function setActionTimer(tableId: string) {
     if (canAutoRunBoard(st)) { runBoardToShowdown(tableId); return }
     const pp = st.players[st.actionIdx]
     if (!pp || pp.folded || pp.allIn) { setActionTimer(tableId); return }
-    afkMode.add(`${tableId}:${pp.id}`)
-    for (const [ws2, c2] of clients) {
-      if (c2.tableId === tableId && c2.playerId === pp.id && ws2.readyState === WebSocket.OPEN)
-        send(ws2, { type: 'you_are_afk' })
+
+    const warnKey = `${tableId}:${pp.id}`
+    const isSF = !!getSFRoomId(tableId)
+    const warnings = (afkWarnings.get(warnKey) ?? 0) + 1
+    afkWarnings.set(warnKey, warnings)
+
+    if (!isSF && warnings < AFK_WARNINGS_BEFORE_AFK) {
+      // Grace: auto-fold but don't mark AFK yet — just warn
+      for (const [ws2, c2] of clients) {
+        if (c2.tableId === tableId && c2.playerId === pp.id && ws2.readyState === WebSocket.OPEN)
+          send(ws2, { type: 'afk_warning', count: warnings, max: AFK_WARNINGS_BEFORE_AFK })
+      }
+      autoFoldPlayer(tableId, pp.id, true)
+    } else {
+      afkMode.add(warnKey)
+      for (const [ws2, c2] of clients) {
+        if (c2.tableId === tableId && c2.playerId === pp.id && ws2.readyState === WebSocket.OPEN)
+          send(ws2, { type: 'you_are_afk' })
+      }
+      scheduleAfkKick(tableId, pp.id)
+      autoFoldPlayer(tableId, pp.id, true)
     }
-    scheduleAfkKick(tableId, pp.id)
-    autoFoldPlayer(tableId, pp.id, true)
   }, ACTION_TIMEOUT_MS))
 }
 
@@ -553,6 +571,7 @@ function handleMessage(ws: WebSocket, msg: any) {
 
   if (type === 'here') {
     afkMode.delete(`${tableId}:${playerId}`)
+    afkWarnings.delete(`${tableId}:${playerId}`)
     cancelAfkKick(tableId, playerId)
     send(ws, { type: 'here_ok' })
     // Resume hand if table was paused waiting for this player
@@ -565,6 +584,7 @@ function handleMessage(ws: WebSocket, msg: any) {
 
   if (type === 'action') {
     afkMode.delete(`${tableId}:${playerId}`)
+    afkWarnings.delete(`${tableId}:${playerId}`)
     cancelAfkKick(tableId, playerId)
     const { action, amount } = msg as { action: PlayerAction; amount?: number }
     const state = tables.get(tableId)
@@ -764,6 +784,7 @@ function handleDisconnect(ws: WebSocket) {
   }
 
   afkMode.delete(`${tableId}:${playerId}`)
+  afkWarnings.delete(`${tableId}:${playerId}`)
   sitOutSet.delete(`${tableId}:${playerId}`)
   cancelAfkKick(tableId, playerId)
   const afkReqTimer = afkRequestTimers.get(`${tableId}:${playerId}`)
@@ -988,6 +1009,7 @@ async function checkSFEnd(state: GameState) {
     if (st) { clearTimeout(st); startTimers.delete(tableId) }
     for (const key of [...playerBanks.keys()]) { if (key.startsWith(`${tableId}:`)) playerBanks.delete(key) }
     for (const key of [...afkMode]) { if (key.startsWith(`${tableId}:`)) afkMode.delete(key) }
+    for (const key of [...afkWarnings.keys()]) { if (key.startsWith(`${tableId}:`)) afkWarnings.delete(key) }
     for (const key of [...sitOutSet]) { if (key.startsWith(`${tableId}:`)) sitOutSet.delete(key) }
     for (const key of [...afkRequestTimers.keys()]) { if (key.startsWith(`${tableId}:`)) { clearTimeout(afkRequestTimers.get(key)!); afkRequestTimers.delete(key) } }
     for (const key of [...afkKickTimers.keys()]) { if (key.startsWith(`${tableId}:`)) { clearTimeout(afkKickTimers.get(key)!); afkKickTimers.delete(key) } }
