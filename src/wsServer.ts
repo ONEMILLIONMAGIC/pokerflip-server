@@ -451,6 +451,7 @@ function runBoardToShowdown(tableId: string): void {
               else startHand(s2)
               tables.set(tableId, s2)
               broadcastTable(tableId)
+              runoutTables.delete(tableId) // must clear before setActionTimer so forced all-in hands trigger runout immediately
               setActionTimer(tableId)
             } else {
               s2.street = 'waiting'
