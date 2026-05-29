@@ -296,6 +296,17 @@ app.post('/api/webhook', async (req, res) => {
   }
 })
 
+// POST /api/feedback — forward user message to admin via bot
+app.post('/api/feedback', async (req, res) => {
+  res.sendStatus(200)
+  const { tgId, name, message, type } = req.body
+  if (!message?.trim()) return
+  const typeLabel = type === 'bug' ? '🐛 Баг' : type === 'question' ? '❓ Вопрос' : '💡 Идея'
+  const from = name ? `*${name}*` : 'Аноним'
+  const text = `${typeLabel} от ${from} (id: \`${tgId || 'unknown'}\`)\n\n${message.trim()}`
+  await tgSend(501197162, text)
+})
+
 // GET /api/notify — send push notifications to users who haven't been active
 app.get('/api/notify', async (req, res) => {
   const secret = req.headers['x-notify-secret']
