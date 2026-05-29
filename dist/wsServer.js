@@ -460,6 +460,7 @@ function runBoardToShowdown(tableId) {
                                 (0, game_1.startHand)(s2);
                             tables.set(tableId, s2);
                             broadcastTable(tableId);
+                            runoutTables.delete(tableId); // must clear before setActionTimer so forced all-in hands trigger runout immediately
                             setActionTimer(tableId);
                         }
                         else {

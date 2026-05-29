@@ -863,7 +863,7 @@ app.post('/api/claim-mission', async (req, res) => {
       const bonusAmount = todayIds.reduce((s, id) => s + (REWARDS[id]?.chips ?? 0), 0)
 
       const { rows: claimedRows } = await db.query(
-        `SELECT mission_id FROM pf_mission_claims WHERE tg_id = $1 AND claimed_at >= CURRENT_DATE`,
+        `SELECT mission_id FROM pf_mission_claims WHERE tg_id = $1 AND claim_date = CURRENT_DATE`,
         [tgId]
       )
       const claimedIds = (claimedRows as any[]).map(r => r.mission_id)
