@@ -299,11 +299,12 @@ app.post('/api/webhook', async (req, res) => {
 // POST /api/feedback — forward user message to admin via bot
 app.post('/api/feedback', async (req, res) => {
   res.sendStatus(200)
-  const { tgId, name, message, type } = req.body
+  const { tgId, name, username, message, type } = req.body
   if (!message?.trim()) return
   const typeLabel = type === 'bug' ? '🐛 Баг' : type === 'question' ? '❓ Вопрос' : '💡 Идея'
   const from = name ? `*${name}*` : 'Аноним'
-  const text = `${typeLabel} от ${from} (id: \`${tgId || 'unknown'}\`)\n\n${message.trim()}`
+  const utagStr = username ? ` @${username}` : ''
+  const text = `${typeLabel} от ${from}${utagStr} (id: \`${tgId || 'unknown'}\`)\n\n${message.trim()}`
   await tgSend(501197162, text)
 })
 
