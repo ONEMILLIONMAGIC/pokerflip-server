@@ -316,7 +316,7 @@ export function removePlayer(state: GameState, id: string): GameState {
 export function maskForPlayer(state: GameState, viewerId: string): GameState {
   const s = structuredClone(state)
   const activeBettors = s.players.filter(p => !p.folded && !p.allIn)
-  const allInShowdown = activeBettors.length <= 1
+  const allInShowdown = activeBettors.length === 0
 
   for (const p of s.players) {
     if (p.id !== viewerId && s.street !== 'showdown') {
