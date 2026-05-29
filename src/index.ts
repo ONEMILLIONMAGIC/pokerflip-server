@@ -308,6 +308,17 @@ app.post('/api/feedback', async (req, res) => {
   await tgSend(501197162, text)
 })
 
+// POST /api/redeem-voucher — notify admin about voucher withdrawal request
+app.post('/api/redeem-voucher', async (req, res) => {
+  res.sendStatus(200)
+  const { tgId, name, username, wallet, amount, type, voucherId } = req.body
+  if (!wallet?.trim()) return
+  const from = name ? `*${name}*` : 'Аноним'
+  const utagStr = username ? ` @${username}` : ''
+  const text = `💸 *Запрос на вывод ваучера*\n\nОт: ${from}${utagStr} (id: \`${tgId || 'unknown'}\`)\nТип: \`${type}\`\nСумма: *$${amount} USDT*\nКошелёк: \`${wallet.trim()}\`\nВаучер: \`${voucherId}\``
+  await tgSend(501197162, text)
+})
+
 // GET /api/notify — send push notifications to users who haven't been active
 app.get('/api/notify', async (req, res) => {
   const secret = req.headers['x-notify-secret']
