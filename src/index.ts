@@ -319,6 +319,16 @@ app.post('/api/redeem-voucher', async (req, res) => {
   await tgSend(501197162, text)
 })
 
+// POST /api/merch-claim — notify admin that user wants to receive merch item
+app.post('/api/merch-claim', async (req, res) => {
+  res.sendStatus(200)
+  const { tgId, name, username, item, sku } = req.body
+  const from = name ? `*${name}*` : 'Аноним'
+  const utagStr = username ? ` @${username}` : ''
+  const text = `🎁 *Запрос на получение мерча*\n\nОт: ${from}${utagStr} (id: \`${tgId || 'unknown'}\`)\nТовар: *${item}*\nСКЮ: \`${sku}\``
+  await tgSend(501197162, text)
+})
+
 // GET /api/notify — send push notifications to users who haven't been active
 app.get('/api/notify', async (req, res) => {
   const secret = req.headers['x-notify-secret']
