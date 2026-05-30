@@ -35,6 +35,55 @@ const afkWarnings = new Map<string, number>() // tableId:playerId → consecutiv
 const AFK_WARNINGS_BEFORE_AFK = 2 // miss this many turns in a row → go AFK
 const tableGifts = new Map<string, Map<string, { giftId: string; tint: string; fromName: string }>>() // tableId → targetId → gift
 
+// ─── Pack drop system ────────────────────────────────────────────────────────
+const handCountPerTable = new Map<string, number>()
+const nextDropAtTable   = new Map<string, number>()
+
+const DROP_PACKS = [
+  { type: 'neon',    name: 'NEON QUANTUM', color: '#00ff88', img: '/packs/neon-quantum.png' },
+  { type: 'stellar', name: 'STELLAR RIFT', color: '#5090ff', img: '/packs/stellar-rift.png' },
+  { type: 'helix',   name: 'HELIX NOVA',   color: '#ff0050', img: '/packs/helix-nova.png' },
+  { type: 'lumen',   name: 'LUMEN CORE',   color: '#c060ff', img: '/packs/lumen-core.png' },
+  { type: 'opus',    name: 'MAGNUM OPUS',  color: '#f0c030', img: '/packs/magnum-opus.png' },
+]
+
+function maybeDropPack(tableId: string, state: GameState): boolean {
+  const count = (handCountPerTable.get(tableId) ?? 0) + 1
+  handCountPerTable.set(tableId, count)
+
+  const threshold = nextDropAtTable.get(tableId) ?? Math.floor(Math.random() * 6 + 10)
+  if (count < threshold) return false
+
+  handCountPerTable.set(tableId, 0)
+  nextDropAtTable.set(tableId, Math.floor(Math.random() * 6 + 10)) // reset: next drop in 10–15 hands
+
+  const winner = state.winners[0]
+  if (!winner) return false
+  const winnerPlayer = state.players.find(p => p.id === winner.playerId)
+  if (!winnerPlayer) return false
+
+  const pack = DROP_PACKS[Math.floor(Math.random() * DROP_PACKS.length)]
+
+  broadcastToTable(tableId, {
+    type: 'pack_drop',
+    winnerId: winnerPlayer.id,
+    winnerName: winnerPlayer.name,
+    packType: pack.type,
+    packName: pack.name,
+    packColor: pack.color,
+    packImg: pack.img,
+  })
+
+  broadcastToTable(tableId, {
+    type: 'chat',
+    playerId: 'system',
+    playerName: 'System',
+    message: `🎁 ${winnerPlayer.name} получил дроп: ${pack.name}!`,
+  })
+
+  return true
+}
+
 const BOMB_PRICES: Record<string, number> = {
   tomato: 50, banana: 100, egg: 100, poop: 200, fish: 250,
   pie: 300, brick: 500, cactus: 750, skull: 1000, bomb: 2500,
@@ -328,7 +377,8 @@ function autoFoldPlayer(tableId: string, playerId: string, isTimed: boolean) {
   st = tables.get(tableId)!
   if (st.street === 'showdown') {
     saveHandStats(st).catch(console.error)
-    scheduleNextHand(tableId, isTimed ? 4500 : 4500)
+    const hasDrop = maybeDropPack(tableId, st)
+    scheduleNextHand(tableId, hasDrop ? 7500 : 4500)
   } else {
     setActionTimer(tableId)
   }
@@ -351,7 +401,8 @@ function foldDisconnectedPlayers(tableId: string) {
   s = tables.get(tableId)!
   if (s.street === 'showdown') {
     saveHandStats(s).catch(console.error)
-    scheduleNextHand(tableId, 4500)
+    const hasDrop = maybeDropPack(tableId, s)
+    scheduleNextHand(tableId, hasDrop ? 7500 : 4500)
   } else {
     setTimeout(() => foldDisconnectedPlayers(tableId), 150)
     setActionTimer(tableId)
@@ -391,7 +442,8 @@ function resolveHandAfterDisconnect(tableId: string) {
     tables.set(tableId, s)
     broadcastTable(tableId)
     saveHandStats(s).catch(console.error)
-    scheduleNextHand(tableId, 4500)
+    const hasDrop = maybeDropPack(tableId, s)
+    scheduleNextHand(tableId, hasDrop ? 7500 : 4500)
   } else if (notFolded.length > 1) {
     tables.set(tableId, s)
     broadcastTable(tableId)
@@ -441,7 +493,8 @@ function runBoardToShowdown(tableId: string): void {
         const afterAdvance = tables.get(tableId)!
         if (afterAdvance.street === 'showdown') {
           saveHandStats(state).catch(console.error)
-          await new Promise<void>(res => setTimeout(res, 4000))
+          const hasDrop = maybeDropPack(tableId, afterAdvance)
+          await new Promise<void>(res => setTimeout(res, hasDrop ? 7000 : 4000))
           const s2 = tables.get(tableId)
           if (!s2) break
           if (!sfEndedTables.has(tableId)) {
@@ -598,7 +651,8 @@ function handleMessage(ws: WebSocket, msg: any) {
 
     if (state.street === 'showdown' && prevStreet !== 'showdown') {
       saveHandStats(state).catch(console.error)
-      scheduleNextHand(tableId)
+      const hasDrop = maybeDropPack(tableId, state)
+      scheduleNextHand(tableId, hasDrop ? 7500 : 4500)
     } else if (canAutoRunBoard(state)) {
       runBoardToShowdown(tableId)
     } else {
